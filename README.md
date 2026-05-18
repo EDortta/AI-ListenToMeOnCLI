@@ -98,6 +98,8 @@ Terminal C (Cursor/Codex)       ← ou aqui
 | `tiny`  | ~150 MB | ~1 s                      | Boa — perde alguns acentos em pt-BR |
 | `small` | ~480 MB | ~5 s                      | Ótima — acentuação quase perfeita   |
 
+> **Nota sobre acentuação:** o modelo `tiny` reconhece o conteúdo corretamente mas pode omitir acentos e cedilhas ("voce" em vez de "você", "nao" em vez de "não"). Isso ocorre porque o modelo menor tem vocabulário mais comprimido. Se a acentuação correta for importante — código, documentação, mensagens formais — use `--model small`. Para uso conversacional e prompts, `tiny` costuma ser suficiente.
+
 ### Troca de idioma por voz
 
 Fale a frase enquanto gravando:
@@ -253,6 +255,8 @@ python3 listen.py --list-devices   # listar micrófonos
 |---------|---------|---------------------------|---------|
 | `tiny`  | ~150 MB | ~1 s                      | Buena — puede perder algunos acentos |
 | `small` | ~480 MB | ~5 s                      | Excelente — precisión casi perfecta  |
+
+> **Nota sobre acentuación:** el modelo `tiny` reconoce el contenido correctamente pero puede omitir tildes y la ñ ("aqui" en vez de "aquí", "no" en vez de "nó"). Esto se debe a que el vocabulario del modelo pequeño está más comprimido. Si la acentuación correcta es importante — código, documentación, mensajes formales — usa `--model small`. Para uso conversacional y prompts, `tiny` suele ser suficiente.
 
 ### Cambio de idioma por voz
 
