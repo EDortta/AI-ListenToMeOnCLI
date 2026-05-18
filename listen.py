@@ -703,6 +703,14 @@ _send_fn           = [None]    # send_text callable, injected by run()
 REC_LIMIT_SECS     = 30        # max active (non-paused) recording seconds per session
 
 
+def _force_stop_recording():
+    """Set armed=False + recording_paused=False atomically (called from audio loop)."""
+    global armed, recording_paused
+    with armed_lock:
+        armed            = False
+        recording_paused = False
+
+
 def cancel_session():
     """Ctrl+Esc: discard buffer and return to IDLE."""
     global armed, recording_paused
@@ -978,9 +986,7 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             if r >= REC_LIMIT_SECS and REC_LIMIT_SECS not in _warned_secs:
                 _warned_secs.add(REC_LIMIT_SECS)
                 _beep(1, duration=0.5, freq=440)
-                with armed_lock:
-                    armed            = False
-                    recording_paused = False
+                _force_stop_recording()
                 _auto_stop_flag[0] = True
                 _set_tray_state("idle")
                 print(f"\n{YELLOW}⏱ {REC_LIMIT_SECS}s — transcrevendo…{RESET}", flush=True)
