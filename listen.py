@@ -418,115 +418,185 @@ def _build_argv(lang: str, model: str, clipboard: bool) -> list:
     return argv
 
 
-def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
+_GLib = None
+_xapp_icon = None
+
+# Symbolic icon names for each state — guaranteed present in any GTK theme
+_ICON_NAMES: dict = {
+    "idle":      "audio-input-microphone",
+    "recording": "media-record",
+    "paused":    "media-playback-pause",
+}
+
+def _install_icons():
+    """Install custom PNGs into hicolor theme for other uses (not used for status icon)."""
     try:
-        import pystray
-        from pystray import Menu, MenuItem
-    except ImportError:
-        print(f"{GRAY}pystray não encontrado — tray desativado (pip install pystray){RESET}")
-        return
+        icon_dir = os.path.expanduser("~/.local/share/icons/hicolor/64x64/apps")
+        os.makedirs(icon_dir, exist_ok=True)
+        for state, sysname in _ICON_NAMES.items():
+            img = make_tray_image(state)
+            if img:
+                img.save(os.path.join(icon_dir, f"listentomecli-{state}.png"))
+        subprocess.run(["gtk-update-icon-cache", "-f",
+                        os.path.expanduser("~/.local/share/icons/hicolor")],
+                       capture_output=True)
+    except Exception:
+        pass
 
-    img = make_tray_image("idle")
-    if img is None:
-        return
 
-    def _set_lang(lang: str):
-        def _action(icon, item):
-            lang_ref[0] = lang
-            print(f"\n{GREEN}⇄  Idioma: {LANG_LABELS[lang]}{RESET}\n")
-            notify("Idioma alterado", LANG_LABELS[lang])
-            icon.update_menu()
-        return _action
+def _build_gtk_menu(lang_ref: list, model_ref: list, clipboard_ref: list):
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk, GLib
+    except Exception:
+        return None
 
-    def _set_model(m: str):
-        def _action(icon, item):
-            if model_ref[0] != m:
+    menu = Gtk.Menu()
+
+    # ── Status (disabled label) ───────────────────────────────────────────────
+    def _status_text():
+        if armed and recording_paused:
+            return "⏸ Pausado"
+        elif armed:
+            return "● Gravando"
+        else:
+            return "○ Aguardando"
+
+    status_item = Gtk.MenuItem(label=f"{_status_text()}  [{lang_ref[0].upper()} · {model_ref[0]}]")
+    status_item.set_sensitive(False)
+    menu.append(status_item)
+    menu.append(Gtk.SeparatorMenuItem())
+
+    # ── Calibrar ──────────────────────────────────────────────────────────────
+    def _calibrate(_item):
+        script = os.path.realpath(__file__)
+        for cmd in [
+            ["x-terminal-emulator", "-e", f"{sys.executable} {script} --calibrate --lang {lang_ref[0]}"],
+            ["xterm", "-e", f"{sys.executable} {script} --calibrate --lang {lang_ref[0]}"],
+        ]:
+            try:
+                subprocess.Popen(cmd)
+                return
+            except FileNotFoundError:
+                continue
+        notify("Calibrar", "Execute: listentomecli --calibrate")
+
+    cal_item = Gtk.MenuItem(label="Calibrar microfone")
+    cal_item.connect("activate", _calibrate)
+    menu.append(cal_item)
+
+    # ── Modelo ────────────────────────────────────────────────────────────────
+    model_item = Gtk.MenuItem(label="Modelo")
+    model_sub = Gtk.Menu()
+    model_group = []
+    for label, key in [("tiny  — rápido (~1s)", "tiny"), ("small — preciso (~5s)", "small")]:
+        rb = Gtk.RadioMenuItem.new_with_label(model_group, label)
+        model_group = rb.get_group()
+        if model_ref[0] == key:
+            rb.set_active(True)
+        def _on_model(item, m=key):
+            if item.get_active() and model_ref[0] != m:
                 model_ref[0] = m
                 notify("Modelo", f"Reiniciando com {m}…")
-                icon.stop()
-                os.execv(sys.executable, _build_argv(lang_ref[0], m, clipboard_ref[0]))
-        return _action
+                GLib.idle_add(_do_restart, lang_ref[0], m, clipboard_ref[0])
+        rb.connect("toggled", _on_model)
+        model_sub.append(rb)
+    model_item.set_submenu(model_sub)
+    menu.append(model_item)
 
-    def _calibrate(icon, item):
-        script = os.path.realpath(__file__)
-        try:
-            subprocess.Popen([
-                "x-terminal-emulator", "-e",
-                f"{sys.executable} {script} --calibrate --lang {lang_ref[0]}",
-            ])
-        except FileNotFoundError:
-            try:
-                subprocess.Popen([
-                    "bash", "-c",
-                    f"xterm -e '{sys.executable} {script} --calibrate --lang {lang_ref[0]}'",
-                ])
-            except Exception:
-                notify("Calibrar", f"Execute no terminal: listentomecli --calibrate")
+    # ── Idioma ────────────────────────────────────────────────────────────────
+    lang_item = Gtk.MenuItem(label="Idioma")
+    lang_sub = Gtk.Menu()
+    lang_group = []
+    for label, key in [("Português (Brasil)", "pt"), ("English (US)", "en"), ("Español", "es")]:
+        rb = Gtk.RadioMenuItem.new_with_label(lang_group, label)
+        lang_group = rb.get_group()
+        if lang_ref[0] == key:
+            rb.set_active(True)
+        def _on_lang(item, lg=key):
+            if item.get_active() and lang_ref[0] != lg:
+                lang_ref[0] = lg
+                print(f"\n{GREEN}⇄  Idioma: {LANG_LABELS[lg]}{RESET}\n", flush=True)
+                notify("Idioma", LANG_LABELS[lg])
+        rb.connect("toggled", _on_lang)
+        lang_sub.append(rb)
+    lang_item.set_submenu(lang_sub)
+    menu.append(lang_item)
 
-    def _restart(icon, item):
-        icon.stop()
-        os.execv(sys.executable, _build_argv(lang_ref[0], model_ref[0], clipboard_ref[0]))
+    menu.append(Gtk.SeparatorMenuItem())
 
-    def _quit(icon, item):
-        icon.stop()
+    # ── Reiniciar / Sair ──────────────────────────────────────────────────────
+    def _on_restart(_item):
+        GLib.idle_add(_do_restart, lang_ref[0], model_ref[0], clipboard_ref[0])
+
+    def _on_quit(_item):
         try:
             os.remove(PID_FILE)
         except Exception:
             pass
         os.kill(os.getpid(), signal.SIGTERM)
 
-    def _status_label(item):
-        if armed and recording_paused:
-            state = "⏸ Pausado"
-        elif armed:
-            state = "● Gravando"
-        else:
-            state = "○ Aguardando"
-        return f"{state}  [{lang_ref[0].upper()} · {model_ref[0]}]"
+    restart_item = Gtk.MenuItem(label="Reiniciar")
+    restart_item.connect("activate", _on_restart)
+    menu.append(restart_item)
 
-    menu = Menu(
-        MenuItem(_status_label, None, enabled=False),
-        Menu.SEPARATOR,
-        MenuItem("Calibrar microfone", _calibrate),
-        MenuItem("Modelo", Menu(
-            MenuItem("tiny  — rápido (~1s)",
-                     _set_model("tiny"),
-                     checked=lambda item: model_ref[0] == "tiny",
-                     radio=True),
-            MenuItem("small — preciso (~5s)",
-                     _set_model("small"),
-                     checked=lambda item: model_ref[0] == "small",
-                     radio=True),
-        )),
-        MenuItem("Idioma", Menu(
-            MenuItem("Português (Brasil)", _set_lang("pt"),
-                     checked=lambda item: lang_ref[0] == "pt", radio=True),
-            MenuItem("English (US)",       _set_lang("en"),
-                     checked=lambda item: lang_ref[0] == "en", radio=True),
-            MenuItem("Español",            _set_lang("es"),
-                     checked=lambda item: lang_ref[0] == "es", radio=True),
-        )),
-        Menu.SEPARATOR,
-        MenuItem("Reiniciar", _restart),
-        MenuItem("Sair", _quit),
-    )
+    quit_item = Gtk.MenuItem(label="Sair")
+    quit_item.connect("activate", _on_quit)
+    menu.append(quit_item)
 
-    global tray_icon
-    tray_icon = pystray.Icon("listentomecli", img, "ListenToMeOnCLI", menu)
+    menu.show_all()
+    return menu
+
+
+def _do_restart(lang: str, model: str, clipboard: bool):
+    from gi.repository import Gtk
+    Gtk.main_quit()
+    os.execv(sys.executable, _build_argv(lang, model, clipboard))
+    return False
+
+
+def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
+    global tray_icon, _GLib, _xapp_icon
     try:
-        tray_icon.run_detached()
-        print(f"{GREEN}✓ Tray iniciado (backend: {os.environ.get('PYSTRAY_BACKEND', '?')}){RESET}",
-              flush=True)
+        import gi
+        gi.require_version("XApp", "1.0")
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import XApp, Gtk, GLib
+        _GLib = GLib
     except Exception as e:
-        print(f"{YELLOW}Tray falhou: {e}{RESET}", flush=True)
-        tray_icon = None
+        print(f"{GRAY}XApp não disponível — tray desativado ({e}){RESET}", flush=True)
+        return
+
+    _install_icons()
+    menu = _build_gtk_menu(lang_ref, model_ref, clipboard_ref)
+
+    si = XApp.StatusIcon()
+    si.set_name("listentomecli")
+    si.set_icon_name(_ICON_NAMES.get("idle", "audio-input-microphone"))
+    si.set_tooltip_text("ListenToMeOnCLI")
+    si.set_visible(True)
+    if menu:
+        si.set_secondary_menu(menu)
+
+    _xapp_icon = si
+    tray_icon   = si   # keep shared reference for _set_tray_state
+
+    def _loop():
+        Gtk.main()
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    print(f"{GREEN}✓ Tray iniciado (XApp){RESET}", flush=True)
 
 
 def _set_tray_state(state: str):
-    if tray_icon:
-        img = make_tray_image(state)
-        if img:
-            tray_icon.icon = img
+    if _xapp_icon is None or _GLib is None:
+        return
+    name = _ICON_NAMES.get(state)
+    if name:
+        _GLib.idle_add(_xapp_icon.set_icon_name, name)
 
 
 def toggle_armed(lang_ref: list):
