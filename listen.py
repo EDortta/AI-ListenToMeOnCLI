@@ -143,16 +143,31 @@ def ask_claude_print(text: str, is_first: bool):
     print(f"{YELLOW}─────────────────────────────{RESET}\n")
 
 
+INITIAL_PROMPTS = {
+    "pt": "Transcrição em português brasileiro com acentuação correta:",
+    "en": "Transcription in English:",
+    "es": "Transcripción en español con acentuación correcta:",
+}
+
 def transcribe(model, audio_bytes: bytes, lang: str) -> str:
-    """Converte bytes PCM int16 → float32 e transcreve com Whisper."""
+    """Converte bytes PCM int16 → float32, normaliza e transcreve com Whisper."""
     if not audio_bytes:
         return ""
     samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+    # Normaliza volume — mic fraco produz sinal muito baixo
+    peak = np.abs(samples).max()
+    if peak > 0.001:
+        samples = samples / peak * 0.95
+
     segments, _ = model.transcribe(
         samples,
         language=LANG_WHISPER.get(lang, lang),
-        vad_filter=True,          # filtra silêncio interno automaticamente
+        initial_prompt=INITIAL_PROMPTS.get(lang, ""),
+        vad_filter=False,              # desligado: VAD corta fala de mic ruim
         beam_size=5,
+        condition_on_previous_text=False,  # evita alucinações em blocos curtos
+        temperature=0,                 # determinístico
     )
     return " ".join(s.text.strip() for s in segments).strip()
 
