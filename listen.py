@@ -200,6 +200,67 @@ def transcribe(model, audio_bytes: bytes, lang: str,
 
 # ── Calibração ────────────────────────────────────────────────────────────────
 
+# Reference texts for accuracy test — public domain, ~15s at normal reading pace
+_ACCURACY_TEXTS = {
+    "pt": (
+        "Era uma noite de verão. Eu vinha no bonde, de volta para casa, "
+        "quando ouvi dois homens discutindo ao meu lado. "
+        "A questão era de somenos, mas animada."
+    ),
+    "en": (
+        "Alice was beginning to get very tired of sitting by her sister on the bank, "
+        "and of having nothing to do. "
+        "Once or twice she had peeped into the book her sister was reading."
+    ),
+    "es": (
+        "En un lugar de la Mancha, de cuyo nombre no quiero acordarme, "
+        "no ha mucho tiempo que vivía un hidalgo de los de lanza en astillero, "
+        "adarga antigua y rocín flaco."
+    ),
+}
+
+
+def _word_accuracy(reference: str, hypothesis: str) -> tuple[float, list]:
+    """Return (accuracy_0_to_1, aligned_pairs) using word-level edit distance."""
+    import unicodedata
+    def _norm(s):
+        s = unicodedata.normalize("NFD", s.lower())
+        s = "".join(c for c in s if unicodedata.category(c) != "Mn")  # strip accents
+        return "".join(c if c.isalnum() or c == " " else " " for c in s).split()
+
+    ref = _norm(reference)
+    hyp = _norm(hypothesis)
+    n, m = len(ref), len(hyp)
+
+    # Wagner-Fischer DP for edit distance
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1): dp[i][0] = i
+    for j in range(m + 1): dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if ref[i-1] == hyp[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+            else:
+                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+
+    errors = dp[n][m]
+    accuracy = max(0.0, 1.0 - errors / max(n, 1))
+
+    # Backtrack to build aligned pairs for display
+    pairs, i, j = [], n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and ref[i-1] == hyp[j-1]:
+            pairs.append(("ok", ref[i-1], hyp[j-1])); i -= 1; j -= 1
+        elif j > 0 and (i == 0 or dp[i][j-1] <= dp[i-1][j] and dp[i][j-1] <= dp[i-1][j-1]):
+            pairs.append(("ins", "", hyp[j-1])); j -= 1
+        elif i > 0 and (j == 0 or dp[i-1][j] <= dp[i][j-1] and dp[i-1][j] <= dp[i-1][j-1]):
+            pairs.append(("del", ref[i-1], "")); i -= 1
+        else:
+            pairs.append(("sub", ref[i-1], hyp[j-1])); i -= 1; j -= 1
+    pairs.reverse()
+    return accuracy, pairs
+
+
 def calibrate(device: int, lang: str, whisper_model: str):
     print(f"\n{BOLD}=== CALIBRAÇÃO ==={RESET}")
     print(f"Microfone: device {device} | Idioma: {LANG_LABELS[lang]} | Modelo: {whisper_model}\n")
@@ -289,7 +350,93 @@ def calibrate(device: int, lang: str, whisper_model: str):
 
     print(f"{GREEN}✓ Perfil salvo em {PROFILE_FILE}{RESET}")
     print(f"{GRAY}  Na próxima execução, será carregado automaticamente.{RESET}\n")
-    print("Para recalibrar a qualquer momento: python3 listen.py --calibrate")
+
+    # ── Etapa 3: teste de acurácia ────────────────────────────────────────────
+    ref_text = _ACCURACY_TEXTS.get(lang)
+    if not ref_text:
+        print("Para recalibrar a qualquer momento: listentomecli --calibrate")
+        return
+
+    print(f"{BOLD}Etapa 3/3 — Teste de acurácia{RESET}")
+    print("Leia o texto abaixo em voz normal (≈15 segundos).")
+    print("Pressione Enter quando terminar.\n")
+    print(f"  {BOLD}┌─ Leia isto: ──────────────────────────────────────────────┐{RESET}")
+    for line in ref_text.split(". "):
+        print(f"  {BOLD}│{RESET}  {line.strip()}.")
+    print(f"  {BOLD}└───────────────────────────────────────────────────────────┘{RESET}\n")
+
+    pa2    = pyaudio.PyAudio()
+    stm2   = pa2.open(format=pyaudio.paInt16, channels=1, rate=SAMPLERATE,
+                      input=True, input_device_index=device,
+                      frames_per_buffer=BLOCK_SIZE)
+
+    input(f"  [{BOLD}Enter para começar{RESET}]")
+    print(f"\n{BOLD}{GREEN}● LENDO — pode começar…{RESET}", flush=True)
+
+    acc_buf     = bytearray()
+    last_sph    = time.time()
+    stop_ev2    = threading.Event()
+
+    def _stop2():
+        input()
+        stop_ev2.set()
+    threading.Thread(target=_stop2, daemon=True).start()
+
+    while not stop_ev2.is_set():
+        data  = stm2.read(BLOCK_SIZE, exception_on_overflow=False)
+        level = rms(data)
+        acc_buf.extend(data)
+        bar = "█" * min(int(level / 400), 20)
+        print(f"\r{PURPLE}🎙 {bar:<20}{RESET} {int(level):4.0f}  "
+              f"{GRAY}{len(acc_buf)/(SAMPLERATE*2):.0f}s{RESET}  ", end="", flush=True)
+        if level > SILENCE_RMS:
+            last_sph = time.time()
+        elif time.time() - last_sph > 3.0 and len(acc_buf) > SAMPLERATE * 3:
+            print(f"\n{GRAY}[silêncio — encerrando]{RESET}")
+            break
+
+    stm2.stop_stream(); stm2.close(); pa2.terminate()
+    print(f"\n{GRAY}Transcrevendo para comparação…{RESET}")
+
+    hyp = transcribe(model, bytes(acc_buf), lang, noise_profile=noise_samples,
+                     initial_prompt="")  # sem initial_prompt para medir o Whisper puro
+
+    accuracy, pairs = _word_accuracy(ref_text, hyp)
+    pct = accuracy * 100
+
+    print(f"\n{BOLD}Resultado:{RESET}")
+    print(f"  Texto reconhecido: {CYAN}{hyp or '(nada)'}{RESET}")
+    print()
+
+    # Word-level diff
+    diff_line = []
+    for kind, ref_w, hyp_w in pairs:
+        if kind == "ok":
+            diff_line.append(f"{GREEN}{ref_w}{RESET}")
+        elif kind == "sub":
+            diff_line.append(f"{RED}[{ref_w}→{hyp_w}]{RESET}")
+        elif kind == "del":
+            diff_line.append(f"{RED}[−{ref_w}]{RESET}")
+        else:  # ins
+            diff_line.append(f"{YELLOW}[+{hyp_w}]{RESET}")
+    print("  " + " ".join(diff_line))
+    print()
+
+    bar_len = 30
+    filled  = int(pct / 100 * bar_len)
+    bar_str = "█" * filled + "░" * (bar_len - filled)
+    color   = GREEN if pct >= 85 else YELLOW if pct >= 60 else RED
+    print(f"  {color}{BOLD}Acurácia: {pct:.0f}%  [{bar_str}]{RESET}")
+
+    if pct >= 85:
+        print(f"  {GREEN}Ótimo! O microfone está bem calibrado para este idioma.{RESET}")
+    elif pct >= 60:
+        print(f"  {YELLOW}Razoável. Fale mais devagar ou use --model small para mais precisão.{RESET}")
+    else:
+        print(f"  {RED}Baixo. Verifique o microfone, reduza o ruído ambiente, ou use --model small.{RESET}")
+
+    print()
+    print("Para recalibrar a qualquer momento: listentomecli --calibrate")
 
 
 # ── Helpers de UI ─────────────────────────────────────────────────────────────
