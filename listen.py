@@ -2,46 +2,46 @@
 """
 listen.py — Voice input for Claude CLI / Cursor / Codex / any window (Linux/X11)
 
-Toggle Ctrl+Space (armar/desarmar microfone):
-  - Registrado via XGrabKey no X server — funciona de qualquer janela
-  - Fallback: Enter neste terminal
-  - Fallback: kill -USR1 $(cat /tmp/listen.pid)
+Reconhecimento via faster-whisper (muito superior ao VOSK para pt/en/es).
 
-Modo --print (legado): passa texto direto para `claude --print`.
-Idiomas: pt (padrão) | en | es — trocáveis por voz durante a sessão.
+Uso:
+  Ctrl+Space  →  arma (começa a gravar)
+  Ctrl+Space  →  desarma (transcreve e digita na janela capturada)
+
+Fallbacks de toggle: Enter neste terminal  |  kill -USR1 $(cat /tmp/listen.pid)
 """
 
 import argparse
+import array
 import json
+import math
 import os
 import signal
 import subprocess
 import sys
 import time
 import threading
+import tempfile
+import wave
 import pyaudio
-from vosk import Model, KaldiRecognizer
+import numpy as np
 
 PID_FILE = "/tmp/listen.pid"
 
-# ── Configurações padrão ─────────────────────────────────────────────────────
 SAMPLERATE   = 16000
-BLOCK_SIZE   = 4000
-SILENCE_SECS = 1.8
-DEVICE_INDEX = 3
+BLOCK_SIZE   = 1024           # ~64ms por chunk — boa resolução p/ VAD
+DEVICE_INDEX = 3              # XWF-1080P USB
+SILENCE_SECS = 2.0            # silêncio para auto-enviar enquanto armado
+SILENCE_RMS  = 200            # abaixo disso = silêncio (int16 RMS)
 CLAUDE_CMD   = os.path.expanduser("~/.local/bin/claude")
-SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 
-MODELS = {
-    "pt": os.path.join(SCRIPT_DIR, "vosk-model-small-pt-0.3"),
-    "en": os.path.join(SCRIPT_DIR, "vosk-model-small-en-us-0.15"),
-    "es": os.path.join(SCRIPT_DIR, "vosk-model-small-es-0.42"),
-}
 LANG_LABELS = {
     "pt": "Português (Brasil)",
     "en": "English (US)",
     "es": "Español (UY/ES)",
 }
+LANG_WHISPER = {"pt": "pt", "en": "en", "es": "es"}
+
 SWITCH_TARGETS = {
     "switch to english":     "en",
     "switch to spanish":     "es",
@@ -54,10 +54,10 @@ SWITCH_TARGETS = {
     "cambiar a portugués":   "pt",
 }
 
-# ── Estado global ────────────────────────────────────────────────────────────
+# ── Estado global ─────────────────────────────────────────────────────────────
 armed              = False
 armed_lock         = threading.Lock()
-target_window      = None   # ID da janela capturada no momento do armar
+target_window      = None
 target_window_name = ""
 
 RED    = "\033[31m"
@@ -70,7 +70,12 @@ RESET  = "\033[0m"
 BOLD   = "\033[1m"
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def rms(data: bytes) -> float:
+    samples = array.array('h', data)
+    return math.sqrt(sum(s * s for s in samples) / len(samples)) if samples else 0
+
 
 def notify(title: str, body: str):
     try:
@@ -80,25 +85,19 @@ def notify(title: str, body: str):
         pass
 
 
-def get_active_window() -> tuple[str, str]:
-    """Retorna (window_id, window_name) da janela focada."""
+def get_active_window() -> tuple:
     try:
-        # Pequena pausa para o X11 estabilizar após o XGrabKey
         time.sleep(0.05)
         r = subprocess.run(["xdotool", "getactivewindow", "getwindowname"],
                            capture_output=True, text=True, check=True)
         lines = r.stdout.strip().splitlines()
-        wid   = lines[0] if lines else ""
-        name  = lines[1] if len(lines) > 1 else "?"
-        return wid, name
+        return (lines[0] if lines else ""), (lines[1] if len(lines) > 1 else "?")
     except Exception:
         return "", "?"
 
 
 def xdotype(text: str, window_id: str | None = None, clipboard: bool = False):
-    """Digita texto na janela alvo via xdotool type ou paste de clipboard."""
     if clipboard:
-        # Coloca no clipboard e simula Ctrl+Shift+V (paste em terminal)
         try:
             subprocess.run(["xclip", "-selection", "clipboard"],
                            input=text.encode(), check=True)
@@ -110,7 +109,7 @@ def xdotype(text: str, window_id: str | None = None, clipboard: bool = False):
             subprocess.run(cmd, check=True)
             return
         except Exception as e:
-            print(f"{YELLOW}clipboard fallback falhou ({e}), tentando type…{RESET}")
+            print(f"{YELLOW}clipboard falhou ({e}), tentando type…{RESET}")
 
     cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "20"]
     if window_id:
@@ -136,6 +135,20 @@ def ask_claude_print(text: str, is_first: bool):
     print(f"{YELLOW}─────────────────────────────{RESET}\n")
 
 
+def transcribe(model, audio_bytes: bytes, lang: str) -> str:
+    """Converte bytes PCM int16 → float32 e transcreve com Whisper."""
+    if not audio_bytes:
+        return ""
+    samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    segments, _ = model.transcribe(
+        samples,
+        language=LANG_WHISPER.get(lang, lang),
+        vad_filter=True,          # filtra silêncio interno automaticamente
+        beam_size=5,
+    )
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
 def toggle_armed(lang_ref: list):
     global armed, target_window, target_window_name
     with armed_lock:
@@ -146,21 +159,11 @@ def toggle_armed(lang_ref: list):
         wid, wname = get_active_window()
         target_window      = wid
         target_window_name = wname
-        print(f"\n{BOLD}{GREEN}● ARMADO [{label}]{RESET} → {CYAN}{wname}{RESET} (id:{wid})", flush=True)
-        notify("🎙 Ouvindo", f"{label} → {wname}")
+        print(f"\n{BOLD}{GREEN}● GRAVANDO [{label}]{RESET} → {CYAN}{wname}{RESET}", flush=True)
+        notify("🎙 Gravando", f"{label} → {wname}")
     else:
-        target_window = None
-        print(f"\n{GRAY}○ Desarmado{RESET}", flush=True)
-        notify("🔇 Mudo", "")
-
-
-def load_model(lang: str):
-    path = MODELS[lang]
-    print(f"  Carregando [{lang}] {LANG_LABELS[lang]} …")
-    model = Model(path)
-    rec   = KaldiRecognizer(model, SAMPLERATE)
-    rec.SetWords(True)
-    return model, rec
+        print(f"\n{GRAY}○ Parado — transcrevendo…{RESET}", flush=True)
+        notify("⏳ Transcrevendo…", "")
 
 
 def list_devices():
@@ -175,57 +178,44 @@ def list_devices():
     print()
 
 
-# ── Hotkey Ctrl+Space via XGrabKey (python-xlib) ─────────────────────────────
+# ── Hotkey Ctrl+Space via XGrabKey ────────────────────────────────────────────
 
 def start_xlib_hotkey(lang_ref: list) -> bool:
-    """
-    Registra Ctrl+Space no X server via XGrabKey.
-    Roda em thread daemon; retorna True se conseguiu registrar.
-    """
     try:
         from Xlib import X, XK, display as xdisplay
-        from Xlib.error import BadAccess
-
         dpy  = xdisplay.Display()
         root = dpy.screen().root
         code = dpy.keysym_to_keycode(XK.string_to_keysym("space"))
-
-        # Registra para todas as combinações de NumLock/CapsLock/etc.
-        modifiers = [
-            X.ControlMask,
-            X.ControlMask | X.Mod2Mask,   # + NumLock
-            X.ControlMask | X.LockMask,   # + CapsLock
-            X.ControlMask | X.Mod2Mask | X.LockMask,
-        ]
-        grabbed = False
-        for mod in modifiers:
-            try:
-                root.grab_key(code, mod, False, X.GrabModeAsync, X.GrabModeAsync)
-                grabbed = True
-            except BadAccess:
-                pass
-
+        mods = [X.ControlMask, X.ControlMask | X.Mod2Mask,
+                X.ControlMask | X.LockMask, X.ControlMask | X.Mod2Mask | X.LockMask]
+        grabbed = any(
+            _try_grab(root, code, m) for m in mods
+        )
         if not grabbed:
             return False
-
         dpy.flush()
 
         def _loop():
             while True:
-                event = dpy.next_event()
-                if event.type == X.KeyPress:
+                ev = dpy.next_event()
+                if ev.type == X.KeyPress:
                     toggle_armed(lang_ref)
-
-        t = threading.Thread(target=_loop, daemon=True)
-        t.start()
+        threading.Thread(target=_loop, daemon=True).start()
+        time.sleep(0.3)
         return True
-
     except Exception as e:
         print(f"{GRAY}XGrabKey falhou: {e}{RESET}")
         return False
 
 
-# ── Thread: toggle por Enter no stdin ────────────────────────────────────────
+def _try_grab(root, code, mod):
+    try:
+        from Xlib import X
+        root.grab_key(code, mod, False, X.GrabModeAsync, X.GrabModeAsync)
+        return True
+    except Exception:
+        return False
+
 
 def start_stdin_toggle(lang_ref: list):
     def _loop():
@@ -238,26 +228,15 @@ def start_stdin_toggle(lang_ref: list):
     threading.Thread(target=_loop, daemon=True).start()
 
 
-# ── Loop principal de áudio ──────────────────────────────────────────────────
+# ── Loop principal ────────────────────────────────────────────────────────────
 
 def run(device: int, initial_lang: str, silence: float, confirm: bool,
-        preload: bool, print_mode: bool, clipboard: bool = False):
+        preload: bool, print_mode: bool, clipboard: bool, whisper_model: str):
 
-    langs = list(MODELS.keys()) if preload else [initial_lang]
-    missing = [l for l in langs if not os.path.isdir(MODELS[l])]
-    if missing:
-        for l in missing:
-            print(f"{RED}Modelo [{l}] não encontrado: {MODELS[l]}{RESET}")
-        sys.exit(1)
-
-    models, recs = {}, {}
-    if preload:
-        print("Pré-carregando todos os modelos:")
-        for l in MODELS:
-            models[l], recs[l] = load_model(l)
-    else:
-        print("Carregando modelo:")
-        models[initial_lang], recs[initial_lang] = load_model(initial_lang)
+    print(f"Carregando Whisper [{whisper_model}] …")
+    from faster_whisper import WhisperModel
+    model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
+    print(f"{GREEN}Pronto.{RESET}")
 
     pa     = pyaudio.PyAudio()
     stream = pa.open(
@@ -273,7 +252,6 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
 
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
-
     signal.signal(signal.SIGUSR1, lambda s, f: toggle_armed(lang_ref))
 
     if print_mode:
@@ -284,20 +262,47 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
     else:
         hotkey_ok = start_xlib_hotkey(lang_ref)
         start_stdin_toggle(lang_ref)
-
         if hotkey_ok:
-            print(f"\n{BOLD}Ctrl+Space{RESET} para armar/desarmar (registrado via XGrabKey)")
+            print(f"{BOLD}Ctrl+Space{RESET} para gravar/transcrever")
         else:
-            print(f"\n{YELLOW}Ctrl+Space não disponível{RESET} — outro app pode ter o grab")
-            print(f"  Alternativas: {BOLD}Enter{RESET} neste terminal  ou  {BOLD}kill -USR1 $(cat {PID_FILE}){RESET}")
-
+            print(f"{YELLOW}Ctrl+Space indisponível{RESET} — use Enter neste terminal ou kill -USR1 $(cat {PID_FILE})")
         print(f"{GRAY}PID: {os.getpid()} | Ctrl+C para encerrar{RESET}\n")
 
-    is_first     = True
-    pending_text = []
-    last_ts      = None
-    was_armed    = False
-    current_rec  = None   # recognizer ativo, para flush no disarm
+    is_first      = True
+    audio_buf     = bytearray()   # acumula PCM enquanto armado
+    last_speech_t = None
+    was_armed     = False
+    vol_chars     = " ▁▂▃▄▅▆▇█"
+
+    def send_text(text: str):
+        nonlocal is_first
+        if not text:
+            return
+        lang = lang_ref[0]
+        # Verifica troca de idioma
+        target = SWITCH_TARGETS.get(text.lower().rstrip(".!?"))
+        if target:
+            if target != lang_ref[0]:
+                lang_ref[0] = target
+                print(f"\n{GREEN}⇄  Idioma: {LANG_LABELS[target]}{RESET}\n")
+            return
+
+        if confirm:
+            print(f"\nEnviar: \"{text}\" ? [Enter=sim / texto=editar / n=descartar] ", end="", flush=True)
+            ans = input()
+            if ans.lower() == "n":
+                print("Descartado.\n")
+                return
+            if ans.strip():
+                text = ans.strip()
+
+        if print_mode:
+            ask_claude_print(text, is_first)
+            is_first = False
+        else:
+            wname = target_window_name or "janela ativa"
+            print(f"\n{CYAN}↳ {wname}: {text}{RESET}")
+            xdotype(text, target_window, clipboard)
 
     try:
         while True:
@@ -306,90 +311,51 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             with armed_lock:
                 cur_armed = armed
 
-            # Transição armado → desarmado: envia o que foi reconhecido
+            # Transição desarmado → transcrevendo e enviando
             if was_armed and not cur_armed:
-                if current_rec:
-                    # Força flush do áudio ainda em buffer no VOSK
-                    flushed = json.loads(current_rec.FinalResult()).get("text", "").strip()
-                    if flushed:
-                        pending_text.append(flushed)
-
-                final = " ".join(pending_text).strip()
-                pending_text.clear()
-                last_ts = None
-                print()
-
-                if final:
-                    if print_mode:
-                        ask_claude_print(final, is_first)
-                        is_first = False
+                print(f"\r{' '*60}\r", end="", flush=True)
+                if audio_buf:
+                    text = transcribe(model, bytes(audio_buf), lang_ref[0])
+                    audio_buf.clear()
+                    last_speech_t = None
+                    if text:
+                        print(f"{PURPLE}◉ {text}{RESET}")
+                        send_text(text)
                     else:
-                        win = target_window
-                        wname = target_window_name or "janela ativa"
-                        print(f"{CYAN}↳ → {wname}: {final}{RESET}")
-                        xdotype(final, win, clipboard)
+                        print(f"{GRAY}(nada reconhecido){RESET}")
+                else:
+                    print(f"{GRAY}(sem áudio gravado){RESET}")
 
             was_armed = cur_armed
 
             if not cur_armed:
                 continue
 
-            lang = lang_ref[0]
-            if lang not in recs:
-                if not os.path.isdir(MODELS[lang]):
-                    print(f"{RED}Modelo [{lang}] ausente{RESET}")
-                    lang_ref[0] = initial_lang
-                    continue
-                models[lang], recs[lang] = load_model(lang)
+            # Acumula áudio
+            audio_buf.extend(data)
 
-            rec = recs[lang]
-            current_rec = rec
-
-            if rec.AcceptWaveform(data):
-                text = json.loads(rec.Result()).get("text", "").strip()
-                if text:
-                    pending_text.append(text)
-                    last_ts = time.time()
-                    print(f"\r{PURPLE}◉{RESET} {' '.join(pending_text)}   ", end="", flush=True)
+            # Indicador de volume em tempo real
+            level = rms(data)
+            if level > SILENCE_RMS:
+                last_speech_t = time.time()
+                bar_idx = min(int(level / 500), len(vol_chars) - 1)
+                bar = vol_chars[bar_idx] * 8
+                print(f"\r{PURPLE}🎙 {bar}{RESET} {int(level):4.0f}  ", end="", flush=True)
             else:
-                partial = json.loads(rec.PartialResult()).get("partial", "").strip()
-                if partial:
-                    last_ts = time.time()
-                    print(f"\r{PURPLE}◉{RESET} {' '.join(pending_text)} {partial}   ", end="", flush=True)
+                print(f"\r{GRAY}🎙 {'·'*8}{RESET}       ", end="", flush=True)
 
-            if pending_text and last_ts and (time.time() - last_ts) > silence:
-                final = " ".join(pending_text).strip()
-                pending_text.clear()
-                last_ts = None
-                print()
-
-                if not final:
-                    continue
-
-                target = SWITCH_TARGETS.get(final.lower().rstrip(".!?"))
-                if target:
-                    if target != lang_ref[0]:
-                        lang_ref[0] = target
-                        print(f"{GREEN}⇄  Idioma: {LANG_LABELS[target]}{RESET}\n")
-                    continue
-
-                if confirm:
-                    print(f"Enviar: \"{final}\" ? [Enter=sim / texto=editar / n=descartar] ", end="", flush=True)
-                    ans = input()
-                    if ans.lower() == "n":
-                        print("Descartado.\n")
-                        continue
-                    if ans.strip():
-                        final = ans.strip()
-
-                if print_mode:
-                    ask_claude_print(final, is_first)
-                    is_first = False
-                else:
-                    win = target_window
-                    win_info = f" → win:{win}" if win else " → janela ativa"
-                    print(f"{CYAN}↳ digitando{win_info}: {final}{RESET}")
-                    xdotype(final, win)
+            # Auto-envio por silêncio prolongado (enquanto armado)
+            if (last_speech_t and
+                    time.time() - last_speech_t > silence and
+                    len(audio_buf) > SAMPLERATE * 0.5):  # mínimo 0.5s de áudio
+                print(f"\r{' '*60}\r", end="", flush=True)
+                print(f"{GRAY}[silêncio — transcrevendo…]{RESET}")
+                text = transcribe(model, bytes(audio_buf), lang_ref[0])
+                audio_buf.clear()
+                last_speech_t = None
+                if text:
+                    print(f"{PURPLE}◉ {text}{RESET}")
+                    send_text(text)
 
     except KeyboardInterrupt:
         print(f"\n{GRAY}Encerrando…{RESET}")
@@ -407,53 +373,51 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Voz → janela focada (xdotool) | Linux/X11",
+        description="Voz → janela focada | faster-whisper | Linux/X11",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Modelos Whisper (CPU):
+  tiny   ~0.6s latência  (padrão — boa qualidade, rápido)
+  small  ~2.8s latência  (melhor qualidade, mais lento)
+
 Exemplos:
-  python3 listen.py               # pt-BR, hotkey Ctrl+Space
-  python3 listen.py --lang en     # inglês
-  python3 listen.py --preload-all # carrega pt+en+es na RAM (~300 MB)
-  python3 listen.py --print       # modo legado: envia para claude --print
-  python3 listen.py --confirm     # pede confirmação antes de digitar
+  python3 listen.py                        # pt-BR, modelo tiny
+  python3 listen.py --model small          # mais preciso
+  python3 listen.py --lang en              # inglês
+  python3 listen.py --clipboard            # cola via Ctrl+Shift+V
+  python3 listen.py --confirm              # pede confirmação antes de digitar
+  python3 listen.py --print                # envia para claude --print
   python3 listen.py --list-devices
-  python3 listen.py --list-models
         """,
     )
     ap.add_argument("--lang",         default="pt", choices=["pt","en","es"])
+    ap.add_argument("--model",        default="tiny", choices=["tiny","small"],
+                    help="Modelo Whisper: tiny (rápido) ou small (mais preciso)")
     ap.add_argument("--device",       type=int,   default=DEVICE_INDEX)
-    ap.add_argument("--silence",      type=float, default=SILENCE_SECS)
+    ap.add_argument("--silence",      type=float, default=SILENCE_SECS,
+                    help=f"Segundos de silêncio para auto-enviar (padrão: {SILENCE_SECS})")
     ap.add_argument("--confirm",      action="store_true")
     ap.add_argument("--print",        dest="print_mode", action="store_true")
     ap.add_argument("--clipboard",    action="store_true",
-                    help="Cola via xclip+Ctrl+Shift+V em vez de xdotool type (melhor para TUIs)")
-    ap.add_argument("--preload-all",  action="store_true")
+                    help="Cola via xclip+Ctrl+Shift+V (melhor para TUIs)")
+    ap.add_argument("--preload-all",  action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--list-devices", action="store_true")
-    ap.add_argument("--list-models",  action="store_true")
+    ap.add_argument("--list-models",  action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args.list_devices:
         list_devices()
         return
 
-    if args.list_models:
-        print("\nModelos VOSK:")
-        for lang, path in MODELS.items():
-            ok = os.path.isdir(path)
-            s  = f"{GREEN}✓ instalado{RESET}" if ok else f"{RED}✗ ausente{RESET}"
-            print(f"  [{lang}] {LANG_LABELS[lang]:28s} {s}")
-            print(f"       {path}")
-        print()
-        return
-
     run(
-        device       = args.device,
-        initial_lang = args.lang,
-        silence      = args.silence,
-        confirm      = args.confirm,
-        preload      = args.preload_all,
-        print_mode   = args.print_mode,
-        clipboard    = args.clipboard,
+        device        = args.device,
+        initial_lang  = args.lang,
+        silence       = args.silence,
+        confirm       = args.confirm,
+        preload       = args.preload_all,
+        print_mode    = args.print_mode,
+        clipboard     = args.clipboard,
+        whisper_model = args.model,
     )
 
 
