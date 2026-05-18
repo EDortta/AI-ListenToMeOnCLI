@@ -275,6 +275,7 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
     pending_text = []
     last_ts      = None
     was_armed    = False
+    current_rec  = None   # recognizer ativo, para flush no disarm
 
     try:
         while True:
@@ -283,11 +284,29 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             with armed_lock:
                 cur_armed = armed
 
+            # Transição armado → desarmado: envia o que foi reconhecido
             if was_armed and not cur_armed:
-                if pending_text:
-                    print(f"\n{GRAY}[descartado]{RESET}")
+                if current_rec:
+                    # Força flush do áudio ainda em buffer no VOSK
+                    flushed = json.loads(current_rec.FinalResult()).get("text", "").strip()
+                    if flushed:
+                        pending_text.append(flushed)
+
+                final = " ".join(pending_text).strip()
                 pending_text.clear()
                 last_ts = None
+                print()
+
+                if final:
+                    if print_mode:
+                        ask_claude_print(final, is_first)
+                        is_first = False
+                    else:
+                        win = target_window
+                        win_info = f" → win:{win}" if win else " → janela ativa"
+                        print(f"{CYAN}↳ digitando{win_info}: {final}{RESET}")
+                        xdotype(final, win)
+
             was_armed = cur_armed
 
             if not cur_armed:
@@ -302,6 +321,7 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
                 models[lang], recs[lang] = load_model(lang)
 
             rec = recs[lang]
+            current_rec = rec
 
             if rec.AcceptWaveform(data):
                 text = json.loads(rec.Result()).get("text", "").strip()
