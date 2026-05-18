@@ -183,16 +183,27 @@ def list_devices():
 def start_xlib_hotkey(lang_ref: list) -> bool:
     try:
         from Xlib import X, XK, display as xdisplay
+        from Xlib.error import BadAccess
+
         dpy  = xdisplay.Display()
         root = dpy.screen().root
         code = dpy.keysym_to_keycode(XK.string_to_keysym("space"))
-        mods = [X.ControlMask, X.ControlMask | X.Mod2Mask,
-                X.ControlMask | X.LockMask, X.ControlMask | X.Mod2Mask | X.LockMask]
-        grabbed = any(
-            _try_grab(root, code, m) for m in mods
-        )
+
+        grabbed = False
+        for mod in [X.ControlMask,
+                    X.ControlMask | X.Mod2Mask,
+                    X.ControlMask | X.LockMask,
+                    X.ControlMask | X.Mod2Mask | X.LockMask]:
+            try:
+                root.grab_key(code, mod, False, X.GrabModeAsync, X.GrabModeAsync)
+                grabbed = True
+            except BadAccess:
+                pass
+
         if not grabbed:
+            print(f"{YELLOW}XGrabKey: Ctrl+Space já está em uso por outro app{RESET}")
             return False
+
         dpy.flush()
 
         def _loop():
@@ -200,20 +211,17 @@ def start_xlib_hotkey(lang_ref: list) -> bool:
                 ev = dpy.next_event()
                 if ev.type == X.KeyPress:
                     toggle_armed(lang_ref)
-        threading.Thread(target=_loop, daemon=True).start()
-        time.sleep(0.3)
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+        time.sleep(0.4)
+        if not t.is_alive():
+            print(f"{RED}XGrabKey: thread de eventos morreu{RESET}")
+            return False
         return True
+
     except Exception as e:
         print(f"{GRAY}XGrabKey falhou: {e}{RESET}")
-        return False
-
-
-def _try_grab(root, code, mod):
-    try:
-        from Xlib import X
-        root.grab_key(code, mod, False, X.GrabModeAsync, X.GrabModeAsync)
-        return True
-    except Exception:
         return False
 
 
