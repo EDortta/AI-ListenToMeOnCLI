@@ -335,14 +335,15 @@ def toggle_armed(lang_ref: list):
         new_val = armed
     label = LANG_LABELS.get(lang_ref[0], lang_ref[0])
     if new_val:
+        print(f"\n{BOLD}{GREEN}● GRAVANDO [{label}]{RESET} — fale agora, mude de janela à vontade", flush=True)
+        notify("🎙 Gravando", label)
+    else:
+        # Capture the focused window NOW — this is where the text will be typed
         wid, wname = get_active_window()
         target_window      = wid
         target_window_name = wname
-        print(f"\n{BOLD}{GREEN}● GRAVANDO [{label}]{RESET} → {CYAN}{wname}{RESET} — fale e mude de janela à vontade", flush=True)
-        notify("🎙 Gravando", f"{label} → {wname}")
-    else:
-        print(f"\n{GRAY}○ Parado — transcrevendo…{RESET}", flush=True)
-        notify("⏳ Transcrevendo…", target_window_name)
+        print(f"\n{GRAY}○ Parado — transcrevendo → {CYAN}{wname}{RESET}", flush=True)
+        notify("⏳ Transcrevendo…", wname)
 
 
 def list_devices():

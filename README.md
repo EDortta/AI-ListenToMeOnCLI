@@ -17,11 +17,13 @@ Microfone → PyAudio → buffer PCM
                      xdotool type → janela focada
 ```
 
-1. O script roda em background num terminal qualquer.
-2. Você **clica na janela de destino** (Claude CLI, Cursor, terminal SSH, browser…).
-3. Pressiona **Ctrl+Space** — o script captura o ID dessa janela e começa a gravar.
-4. Você fala à vontade.
-5. **Ctrl+Space de novo** (ou silêncio de 2 s) → o áudio vai para o Whisper, que transcreve tudo de uma vez e digita o texto na janela capturada via `xdotool`.
+1. O script roda em background (ou como serviço systemd).
+2. Pressiona **Ctrl+Space** para começar a gravar — pode estar em qualquer janela.
+3. Fala à vontade. **Pode mudar de janela enquanto fala** — o destino é escolhido só no passo 4.
+4. Clica na janela de destino (Claude CLI, Cursor, terminal, browser…).
+5. **Ctrl+Space de novo** (ou silêncio de 2 s) → o Whisper transcreve o bloco inteiro e cola o texto na janela que estava ativa neste momento.
+
+> **Detalhe importante:** a janela de destino é capturada no momento de **parar** (segundo Ctrl+Space), não no de começar. Isso significa que você pode iniciar o ditado, continuar falando livremente, navegar para onde quiser, e só precisar estar na janela certa na hora de parar.
 
 O Whisper recebe o bloco de áudio inteiro ao invés de processar palavra por palavra — por isso a qualidade é muito superior a soluções de streaming como VOSK.
 
@@ -106,16 +108,17 @@ python3 listen.py --list-devices
 ### Fluxo de uso com múltiplas janelas
 
 ```
-Terminal A (listen.py rodando em background)
-Terminal B (claude CLI)         ← você quer falar aqui
-Terminal C (Cursor/Codex)       ← ou aqui
+Terminal A (listen.py / serviço rodando)
+Terminal B (claude CLI)
+Terminal C (Cursor/Codex)
 ```
 
-1. Clique em Terminal B (ou C).
-2. Pressione **Ctrl+Space** — aparece `● GRAVANDO → Terminal B` + notificação desktop.
-3. Fale sua mensagem completa, sem pressa.
-4. Pressione **Ctrl+Space** novamente → transcrição aparece e é digitada em Terminal B.
-5. Para mandar para outra janela: clique nela e repita.
+1. Pressione **Ctrl+Space** em qualquer janela para começar a gravar.
+2. Fale à vontade. Você pode mudar de janela enquanto fala.
+3. Navegue até a janela onde quer que o texto apareça (ex: Terminal B).
+4. Pressione **Ctrl+Space** novamente — o texto é colado exatamente onde você está agora.
+
+> A janela é capturada no **segundo** Ctrl+Space, não no primeiro. Comece a gravar em qualquer lugar, escolha o destino ao parar.
 
 **Se Ctrl+Space não funcionar** (outro app com o grab):
 - Pressione **Enter** no terminal do listen.py
@@ -232,14 +235,15 @@ listentomecli --list-devices       # list microphones
 
 When running as a service, it's already listening in the background.
 
-1. (If not a service) run `listentomecli` in any terminal.
-2. **Click** the destination window (Claude CLI, Cursor, Codex, browser…).
-3. Press **Ctrl+Space** → shows `● RECORDING → <window name>` + desktop notification.
-4. Speak your full message at a natural pace.
-5. Press **Ctrl+Space** again (or wait 2 s of silence) → Whisper transcribes the whole block and types it into the captured window.
+1. Press **Ctrl+Space** from any window to start recording.
+2. Speak your message at a natural pace. **You can switch windows while speaking.**
+3. Navigate to the window where you want the text to appear.
+4. Press **Ctrl+Space** again (or wait 2 s of silence) → Whisper transcribes the whole block and pastes it into whatever window is focused right now.
+
+> **Key detail:** the destination window is captured at **stop** time (second Ctrl+Space), not at start. Start recording anywhere, choose your target when you stop.
 
 **Ctrl+Space fallbacks:**
-- Press **Enter** in the listen.py terminal
+- Press **Enter** in the listentomecli terminal
 - `kill -USR1 $(cat /tmp/listen.pid)` from any terminal
 
 ### Whisper models
@@ -330,14 +334,15 @@ python3 listen.py --list-devices   # listar micrófonos
 
 ### Flujo con múltiples ventanas
 
-1. Ejecuta `python3 listen.py` (minimiza o déjalo en una terminal lateral).
-2. **Haz clic** en la ventana destino (Claude CLI, Cursor, Codex, navegador…).
-3. Presiona **Ctrl+Space** → aparece `● GRABANDO → <nombre ventana>` + notificación.
-4. Habla tu mensaje completo a ritmo natural.
-5. Presiona **Ctrl+Space** de nuevo (o espera 2 s de silencio) → Whisper transcribe todo el bloque y lo escribe en la ventana capturada.
+1. Presiona **Ctrl+Space** desde cualquier ventana para empezar a grabar.
+2. Habla con calma. **Puedes cambiar de ventana mientras hablas.**
+3. Navega a la ventana donde quieres que aparezca el texto.
+4. Presiona **Ctrl+Space** de nuevo (o espera 2 s de silencio) → Whisper transcribe todo el bloque y lo pega en la ventana que esté activa en ese momento.
+
+> **Detalle clave:** la ventana destino se captura al **detener** (segundo Ctrl+Space), no al iniciar. Empieza a grabar en cualquier lugar, elige el destino al parar.
 
 **Fallbacks para Ctrl+Space:**
-- Presiona **Enter** en la terminal de listen.py
+- Presiona **Enter** en la terminal de listentomecli
 - `kill -USR1 $(cat /tmp/listen.pid)` desde cualquier terminal
 
 ### Modelos Whisper
