@@ -302,6 +302,23 @@ def notify(title: str, body: str):
         pass
 
 
+def _beep(count: int = 1, duration: float = 0.12, freq: float = 880, gap: float = 0.06):
+    """Play N beeps asynchronously via aplay (no extra deps)."""
+    try:
+        sr = 22050
+        t = np.linspace(0, duration, int(sr * duration), False)
+        tone = (np.sin(2 * np.pi * freq * t) * 32767 * 0.4).astype(np.int16)
+        silence_chunk = np.zeros(int(sr * gap), dtype=np.int16)
+        samples = np.tile(np.concatenate([tone, silence_chunk]), count).tobytes()
+        proc = subprocess.Popen(
+            ["aplay", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "1", "-"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        threading.Thread(target=lambda: proc.communicate(samples), daemon=True).start()
+    except Exception:
+        pass
+
+
 def get_active_window() -> tuple:
     try:
         from Xlib import display as xdisplay, X
@@ -599,9 +616,54 @@ def _set_tray_state(state: str):
         _GLib.idle_add(_xapp_icon.set_icon_name, name)
 
 
+def _start_blink():
+    """Blink tray icon to signal pending-paste state."""
+    if _GLib is None or _xapp_icon is None:
+        return
+    _blink_state[0] = False
+    def _tick():
+        if _xapp_icon is None:
+            return False
+        _blink_state[0] = not _blink_state[0]
+        name = "media-record" if _blink_state[0] else "audio-input-microphone"
+        _xapp_icon.set_icon_name(name)
+        return True  # keep repeating
+    _blink_timer[0] = _GLib.timeout_add(500, _tick)
+
+
+def _stop_blink():
+    """Stop blinking and restore idle icon."""
+    if _GLib is None:
+        return
+    if _blink_timer[0] is not None:
+        _GLib.source_remove(_blink_timer[0])
+        _blink_timer[0] = None
+    _set_tray_state("idle")
+
+
 def toggle_armed(lang_ref: list):
-    """Ctrl+Space: start session (IDLE→RECORDING) or send (RECORDING/PAUSED→IDLE)."""
+    """Ctrl+Space: paste pending text, start new session, or stop and send."""
     global armed, recording_paused, target_window, target_window_name
+
+    # Still transcribing after auto-stop — ignore
+    if _transcribing_flag[0]:
+        print(f"{GRAY}[transcrevendo… aguarde]{RESET}", flush=True)
+        return
+
+    # Pending paste: this Ctrl+Space means "paste here"
+    if _pending_text[0] is not None:
+        _stop_blink()
+        wid, wname = get_active_window()
+        target_window      = wid
+        target_window_name = wname
+        text = _pending_text[0]
+        _pending_text[0] = None
+        print(f"\n{GRAY}○ Colando → {CYAN}{wname}{RESET}", flush=True)
+        notify("📋 Colando…", wname)
+        if _send_fn[0]:
+            threading.Thread(target=_send_fn[0], args=(text,), daemon=True).start()
+        return
+
     with armed_lock:
         armed = not armed
         new_val = armed
@@ -643,7 +705,14 @@ def toggle_paused(lang_ref: list):
         notify("🎙 Retomado", label)
 
 
-_cancel_flag = [False]   # shared between cancel_session() and the audio loop
+_cancel_flag       = [False]   # shared between cancel_session() and the audio loop
+_auto_stop_flag    = [False]   # set when 30s limit is hit
+_pending_text      = [None]    # transcribed text waiting for user to pick paste target
+_transcribing_flag = [False]   # True while auto-stop transcription runs (blocks new sessions)
+_blink_timer       = [None]    # GLib timeout handle for pending-state blink
+_blink_state       = [False]   # current blink phase
+_send_fn           = [None]    # send_text callable, injected by run()
+REC_LIMIT_SECS     = 30        # max active (non-paused) recording seconds per session
 
 
 def cancel_session():
@@ -653,10 +722,14 @@ def cancel_session():
         was_armed = armed
         armed            = False
         recording_paused = False
-    if was_armed:
-        _cancel_flag[0] = True
+    had_pending = _pending_text[0] is not None
+    if was_armed or had_pending:
+        _cancel_flag[0]  = True
+        _pending_text[0] = None
+        _stop_blink()
         _set_tray_state("idle")
-        print(f"\n{GRAY}✗ Sessão cancelada — buffer descartado{RESET}", flush=True)
+        msg = "✗ Sessão cancelada — buffer descartado" if was_armed else "✗ Texto pendente descartado"
+        print(f"\n{GRAY}{msg}{RESET}", flush=True)
         notify("✗ Cancelado", "Buffer descartado")
 
 
@@ -806,11 +879,13 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             print(f"{YELLOW}Ctrl+Space indisponível{RESET} — use Enter neste terminal ou kill -USR1 $(cat {PID_FILE})")
         print(f"{GRAY}PID: {os.getpid()} | Ctrl+C para encerrar{RESET}\n")
 
-    is_first      = True
-    audio_buf     = bytearray()
-    last_speech_t = None
-    was_armed     = False
-    vol_chars     = " ▁▂▃▄▅▆▇█"
+    is_first             = True
+    audio_buf            = bytearray()
+    last_speech_t        = None
+    was_armed            = False
+    vol_chars            = " ▁▂▃▄▅▆▇█"
+    _total_rec_secs      = 0.0   # active (non-paused) seconds in current session
+    _warned_secs: set    = set()  # which thresholds have already beeped
 
     def do_transcribe(buf: bytes) -> str:
         return transcribe(model, buf, lang_ref[0],
@@ -843,6 +918,8 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             print(f"\n{CYAN}↳ {wname}: {text}{RESET}")
             xdotype(text, clipboard=clipboard)
 
+    _send_fn[0] = send_text
+
     try:
         while True:
             data = stream.read(BLOCK_SIZE, exception_on_overflow=False)
@@ -851,20 +928,40 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
                 cur_armed  = armed
                 cur_paused = recording_paused
 
-            # Session ended (Ctrl+Space to send, or cancel_session)
+            # Session ended (Ctrl+Space to send, auto-stop, or cancel_session)
             if was_armed and not cur_armed:
                 print(f"\r{' '*60}\r", end="", flush=True)
-                cancelled = _cancel_flag[0]
+                cancelled   = _cancel_flag[0]
                 _cancel_flag[0] = False
+                auto_stopped = _auto_stop_flag[0]
+                _auto_stop_flag[0] = False
+                _total_rec_secs = 0.0
+                _warned_secs.clear()
                 if audio_buf and not cancelled:
-                    text = do_transcribe(bytes(audio_buf))
-                    audio_buf.clear()
-                    last_speech_t = None
-                    if text:
-                        print(f"{PURPLE}◉ {text}{RESET}")
-                        send_text(text)
+                    if auto_stopped:
+                        _transcribing_flag[0] = True
+                        text = do_transcribe(bytes(audio_buf))
+                        _transcribing_flag[0] = False
+                        audio_buf.clear()
+                        last_speech_t = None
+                        if text:
+                            print(f"{PURPLE}◉ {text}{RESET}")
+                            _pending_text[0] = text
+                            _start_blink()
+                            print(f"{YELLOW}⏳ Ctrl+Space na janela destino para colar{RESET}",
+                                  flush=True)
+                            notify("⏳ Pronto para colar", "Ctrl+Space na janela destino")
+                        else:
+                            print(f"{GRAY}(nada reconhecido){RESET}")
                     else:
-                        print(f"{GRAY}(nada reconhecido){RESET}")
+                        text = do_transcribe(bytes(audio_buf))
+                        audio_buf.clear()
+                        last_speech_t = None
+                        if text:
+                            print(f"{PURPLE}◉ {text}{RESET}")
+                            send_text(text)
+                        else:
+                            print(f"{GRAY}(nada reconhecido){RESET}")
                 else:
                     audio_buf.clear()
                     last_speech_t = None
@@ -877,6 +974,29 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
                 continue
 
             audio_buf.extend(data)
+            _total_rec_secs += BLOCK_SIZE / SAMPLERATE
+
+            # Warning beeps and 30s auto-stop (counts only active recording, not paused)
+            r = _total_rec_secs
+            if r >= 10 and 10 not in _warned_secs:
+                _warned_secs.add(10)
+                _beep(1)
+            if r >= 20 and 20 not in _warned_secs:
+                _warned_secs.add(20)
+                _beep(2)
+            if r >= 25 and 25 not in _warned_secs:
+                _warned_secs.add(25)
+                _beep(3, duration=0.07, gap=0.04)
+            if r >= REC_LIMIT_SECS and REC_LIMIT_SECS not in _warned_secs:
+                _warned_secs.add(REC_LIMIT_SECS)
+                _beep(1, duration=0.5, freq=440)
+                with armed_lock:
+                    armed            = False
+                    recording_paused = False
+                _auto_stop_flag[0] = True
+                _set_tray_state("idle")
+                print(f"\n{YELLOW}⏱ {REC_LIMIT_SECS}s — transcrevendo…{RESET}", flush=True)
+                notify("⏱ Limite atingido", "Transcrevendo…")
 
             level = rms(data)
             buf_secs = len(audio_buf) / (SAMPLERATE * 2)
