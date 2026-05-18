@@ -1,6 +1,7 @@
 # ListenToMeOnCLI
 
-> Speak to your terminal instead of typing — voice input for Claude CLI, Cursor, Codex, or any focused window.
+> Speak to your terminal instead of typing — voice input for Claude CLI, Cursor, Codex, or any focused window.  
+> **Platform:** Linux / X11. Windows and macOS already have built-in dictation (`Win+H` and `Fn` double-tap respectively); this project fills the gap on Linux and serves anyone who needs fully offline, privacy-first recognition on any platform.
 
 ---
 
@@ -15,6 +16,8 @@
 
 Speech recognition runs **100% offline** — no audio leaves your machine.
 
+> **Why not Windows/macOS?** Both have solid built-in dictation: `Win+H` on Windows 10/11 and double-tap `Fn` / Globe key on macOS. This project targets Linux, where no native equivalent exists, and privacy-focused users who want zero cloud dependency on any OS.
+
 Supports three languages in the same session, switchable by voice:
 
 | Code | Language          | VOSK model                   |
@@ -26,7 +29,7 @@ Supports three languages in the same session, switchable by voice:
 ### Requirements
 
 - Python 3.8+
-- Linux (X11) — tested on Ubuntu 22.04
+- Linux with X11 — tested on Ubuntu 22.04
 - A microphone (USB or built-in)
 
 ```bash
@@ -34,7 +37,7 @@ Supports three languages in the same session, switchable by voice:
 sudo apt-get install -y xdotool python3-pyaudio portaudio19-dev
 
 # Python packages
-pip install vosk pynput pyaudio
+pip install vosk pyaudio python-xlib
 ```
 
 ### Download VOSK models
@@ -84,10 +87,15 @@ python3 listen.py --list-models
 
 1. Run `python3 listen.py` (minimize or leave in a side terminal).
 2. **Click** the window you want to send text to (Claude CLI, Cursor, Codex, browser…).
-3. Press **Ctrl+Space** → terminal shows `● ARMED` + desktop notification.
+3. Press **Ctrl+Space** → terminal shows `● ARMED` + desktop notification.  
+   *(Ctrl+Space is grabbed via XGrabKey — works from any focused window.)*
 4. Speak — recognized text streams in real time.
 5. Silence for ~1.8 s → text is typed into the focused window via `xdotool`.
 6. Press **Ctrl+Space** again to disarm (pending text is discarded).
+
+**Fallbacks if Ctrl+Space is taken by another app:**
+- Press **Enter** in the listen.py terminal
+- Run `kill -USR1 $(cat /tmp/listen.pid)` from any terminal (add as a shell alias)
 
 ### Switching languages by voice
 
@@ -140,10 +148,12 @@ Default is device index `3` (USB camera mic). Edit `DEVICE_INDEX` at the top of 
 
 Suporta três idiomas na mesma sessão, trocáveis por voz.
 
+> **Por que não Windows/macOS?** Windows 10/11 tem ditado nativo com `Win+H` e macOS tem ditado via duplo toque em `Fn` / tecla Globe. Este projeto resolve a lacuna no Linux e atende quem precisa de reconhecimento 100% offline sem nuvem.
+
 ### Requisitos
 
 - Python 3.8+
-- Linux (X11) — testado no Ubuntu 22.04
+- Linux com X11 — testado no Ubuntu 22.04
 - Microfone (USB ou integrado)
 
 ```bash
@@ -151,7 +161,7 @@ Suporta três idiomas na mesma sessão, trocáveis por voz.
 sudo apt-get install -y xdotool python3-pyaudio portaudio19-dev
 
 # Pacotes Python
-pip install vosk pynput pyaudio
+pip install vosk pyaudio python-xlib
 ```
 
 ### Download dos modelos VOSK
@@ -192,10 +202,15 @@ python3 listen.py --list-devices
 
 1. Rode `python3 listen.py` (minimize ou deixe em terminal lateral).
 2. **Clique** na janela de destino (terminal do Claude, Cursor, Codex, browser…).
-3. Pressione **Ctrl+Space** → aparece `● ARMADO` + notificação desktop.
+3. Pressione **Ctrl+Space** → aparece `● ARMADO` + notificação desktop.  
+   *(Ctrl+Space é registrado via XGrabKey — funciona de qualquer janela focada.)*
 4. Fale — texto aparece em tempo real no terminal do script.
 5. Silêncio de ~1.8 s → texto é digitado na janela focada via `xdotool`.
 6. Pressione **Ctrl+Space** novamente para desarmar.
+
+**Fallbacks se Ctrl+Space estiver ocupado:**
+- Pressione **Enter** no terminal do listen.py
+- `kill -USR1 $(cat /tmp/listen.pid)` de qualquer terminal
 
 ### Troca de idioma por voz
 
@@ -218,6 +233,8 @@ python3 listen.py --list-devices
 - envía el texto directamente a `claude --print` como subproceso (modo `--print` legacy).
 
 Soporta tres idiomas en la misma sesión, cambiables por voz.
+
+> **¿Por qué no Windows/macOS?** Windows 10/11 tiene dictado nativo con `Win+H` y macOS tiene dictado vía doble toque en `Fn` / tecla Globe. Este proyecto cubre la brecha en Linux y sirve a quienes necesitan reconocimiento 100% offline sin nube.
 
 ### Requisitos
 
@@ -271,10 +288,15 @@ python3 listen.py --list-devices
 
 1. Ejecuta `python3 listen.py` (minimiza o déjalo en una terminal lateral).
 2. **Haz clic** en la ventana de destino (terminal de Claude, Cursor, Codex, navegador…).
-3. Presiona **Ctrl+Space** → aparece `● ARMADO` + notificación de escritorio.
+3. Presiona **Ctrl+Space** → aparece `● ARMADO` + notificación de escritorio.  
+   *(Ctrl+Space se registra vía XGrabKey — funciona desde cualquier ventana enfocada.)*
 4. Habla — el texto aparece en tiempo real en la terminal del script.
 5. Silencio de ~1.8 s → el texto es escrito en la ventana enfocada vía `xdotool`.
 6. Presiona **Ctrl+Space** nuevamente para desarmar.
+
+**Fallbacks si Ctrl+Space está ocupado:**
+- Presiona **Enter** en la terminal de listen.py
+- `kill -USR1 $(cat /tmp/listen.pid)` desde cualquier terminal
 
 ### Cambio de idioma por voz
 
