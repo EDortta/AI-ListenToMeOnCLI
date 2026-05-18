@@ -107,25 +107,22 @@ def get_active_window() -> tuple:
         return "", "?"
 
 
-def xdotype(text: str, window_id: str | None = None, clipboard: bool = False):
+def xdotype(text: str, window_id: str | None = None, clipboard: bool = True):
+    """Cola texto na janela focada via clipboard (padrão) ou xdotool type."""
     if clipboard:
         try:
             subprocess.run(["xclip", "-selection", "clipboard"],
                            input=text.encode(), check=True)
-            time.sleep(0.05)
-            cmd = ["xdotool", "key", "--clearmodifiers"]
-            if window_id:
-                cmd += ["--window", window_id]
-            cmd.append("ctrl+shift+v")
-            subprocess.run(cmd, check=True)
+            time.sleep(0.08)
+            # Ctrl+Shift+V na janela focada AGORA — sem precisar de window ID
+            subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
+                           check=True)
             return
         except Exception as e:
             print(f"{YELLOW}clipboard falhou ({e}), tentando type…{RESET}")
 
-    cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "20"]
-    if window_id:
-        cmd += ["--window", window_id]
-    cmd += ["--", text]
+    # Fallback: xdotool type sem window ID (janela focada no momento)
+    cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text]
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError:
@@ -319,9 +316,9 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             ask_claude_print(text, is_first)
             is_first = False
         else:
-            wname = target_window_name or "janela ativa"
+            wname = target_window_name or "janela focada"
             print(f"\n{CYAN}↳ {wname}: {text}{RESET}")
-            xdotype(text, target_window, clipboard)
+            xdotype(text, clipboard=clipboard)
 
     try:
         while True:
