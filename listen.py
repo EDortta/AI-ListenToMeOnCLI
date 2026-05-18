@@ -2,13 +2,13 @@
 """
 listen.py — Voice input for Claude CLI / Cursor / Codex / any window (Linux/X11)
 
-Reconhecimento via faster-whisper (muito superior ao VOSK para pt/en/es).
+Reconhecimento via faster-whisper + noisereduce (offline, sem nuvem).
 
-Uso:
-  Ctrl+Space  →  arma (começa a gravar)
-  Ctrl+Space  →  desarma (transcreve e digita na janela capturada)
+Uso básico:
+  python3 listen.py --calibrate   # calibra microfone e voz (faça primeiro)
+  python3 listen.py               # usa perfil salvo, Ctrl+Space para gravar
 
-Fallbacks de toggle: Enter neste terminal  |  kill -USR1 $(cat /tmp/listen.pid)
+Toggle: Ctrl+Space | Enter neste terminal | kill -USR1 $(cat /tmp/listen.pid)
 """
 
 import argparse
@@ -21,18 +21,19 @@ import subprocess
 import sys
 import time
 import threading
-import tempfile
-import wave
 import pyaudio
 import numpy as np
 
-PID_FILE = "/tmp/listen.pid"
+PID_FILE    = "/tmp/listen.pid"
+PROFILE_DIR = os.path.expanduser("~/.config/listentomecli")
+PROFILE_FILE = os.path.join(PROFILE_DIR, "profile.json")
+NOISE_FILE   = os.path.join(PROFILE_DIR, "noise_profile.npy")
 
 SAMPLERATE   = 16000
-BLOCK_SIZE   = 1024           # ~64ms por chunk — boa resolução p/ VAD
-DEVICE_INDEX = 3              # XWF-1080P USB
-SILENCE_SECS = 2.0            # silêncio para auto-enviar enquanto armado
-SILENCE_RMS  = 200            # abaixo disso = silêncio (int16 RMS)
+BLOCK_SIZE   = 1024
+DEVICE_INDEX = 3
+SILENCE_SECS = 2.0
+SILENCE_RMS  = 200
 CLAUDE_CMD   = os.path.expanduser("~/.local/bin/claude")
 
 LANG_LABELS = {
@@ -54,6 +55,12 @@ SWITCH_TARGETS = {
     "cambiar a portugués":   "pt",
 }
 
+DEFAULT_PROMPTS = {
+    "pt": "Transcrição em português brasileiro com acentuação correta:",
+    "en": "Transcription in English:",
+    "es": "Transcripción en español con acentuación correcta:",
+}
+
 # ── Estado global ─────────────────────────────────────────────────────────────
 armed              = False
 armed_lock         = threading.Lock()
@@ -70,12 +77,196 @@ RESET  = "\033[0m"
 BOLD   = "\033[1m"
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Perfil ────────────────────────────────────────────────────────────────────
+
+def load_profile() -> dict:
+    if os.path.exists(PROFILE_FILE):
+        try:
+            with open(PROFILE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_profile(data: dict):
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    with open(PROFILE_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def load_noise_profile() -> np.ndarray | None:
+    if os.path.exists(NOISE_FILE):
+        try:
+            return np.load(NOISE_FILE)
+        except Exception:
+            pass
+    return None
+
+
+def save_noise_profile(arr: np.ndarray):
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    np.save(NOISE_FILE, arr)
+
+
+# ── Áudio ─────────────────────────────────────────────────────────────────────
 
 def rms(data: bytes) -> float:
     samples = array.array('h', data)
     return math.sqrt(sum(s * s for s in samples) / len(samples)) if samples else 0
 
+
+def record_seconds(stream, seconds: float) -> bytes:
+    """Grava N segundos do stream e retorna bytes PCM int16."""
+    buf = bytearray()
+    n_blocks = int(seconds * SAMPLERATE / BLOCK_SIZE)
+    for _ in range(n_blocks):
+        buf.extend(stream.read(BLOCK_SIZE, exception_on_overflow=False))
+    return bytes(buf)
+
+
+def pcm_to_float(audio_bytes: bytes) -> np.ndarray:
+    return np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def normalize(samples: np.ndarray) -> np.ndarray:
+    peak = np.abs(samples).max()
+    return samples / peak * 0.95 if peak > 0.001 else samples
+
+
+# ── Transcrição ───────────────────────────────────────────────────────────────
+
+def transcribe(model, audio_bytes: bytes, lang: str,
+               noise_profile: np.ndarray | None = None,
+               initial_prompt: str = "") -> str:
+    if not audio_bytes:
+        return ""
+
+    samples = pcm_to_float(audio_bytes)
+    samples = normalize(samples)
+
+    if noise_profile is not None:
+        try:
+            import noisereduce as nr
+            samples = nr.reduce_noise(
+                y=samples,
+                sr=SAMPLERATE,
+                y_noise=noise_profile,
+                prop_decrease=0.8,
+                stationary=True,
+            )
+        except Exception as e:
+            print(f"{YELLOW}noisereduce falhou ({e}){RESET}")
+
+    prompt = initial_prompt or DEFAULT_PROMPTS.get(lang, "")
+
+    segments, _ = model.transcribe(
+        samples,
+        language=LANG_WHISPER.get(lang, lang),
+        initial_prompt=prompt,
+        vad_filter=False,
+        beam_size=5,
+        condition_on_previous_text=False,
+        temperature=0,
+    )
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+# ── Calibração ────────────────────────────────────────────────────────────────
+
+def calibrate(device: int, lang: str, whisper_model: str):
+    print(f"\n{BOLD}=== CALIBRAÇÃO ==={RESET}")
+    print(f"Microfone: device {device} | Idioma: {LANG_LABELS[lang]} | Modelo: {whisper_model}\n")
+
+    pa     = pyaudio.PyAudio()
+    stream = pa.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=SAMPLERATE,
+        input=True,
+        input_device_index=device,
+        frames_per_buffer=BLOCK_SIZE,
+    )
+
+    # ── Etapa 1: perfil de ruído ──────────────────────────────────────────────
+    print(f"{BOLD}Etapa 1/2 — Perfil de ruído{RESET}")
+    print("Fique em SILÊNCIO (sem falar) por 3 segundos...")
+    for i in range(3, 0, -1):
+        print(f"  {i}...", end=" ", flush=True)
+        time.sleep(1)
+    print("gravando!", flush=True)
+
+    noise_bytes   = record_seconds(stream, 3.0)
+    noise_samples = pcm_to_float(noise_bytes)
+    save_noise_profile(noise_samples)
+    noise_rms = math.sqrt(np.mean(noise_samples ** 2)) * 32768
+    print(f"{GREEN}✓ Perfil de ruído salvo (RMS ambiente: {noise_rms:.0f}){RESET}\n")
+
+    # ── Etapa 2: perfil de voz ────────────────────────────────────────────────
+    print(f"{BOLD}Etapa 2/2 — Perfil de voz{RESET}")
+    print("Fale normalmente por ~15 segundos.")
+    print("Pode contar o que quiser: o que você faz, um projeto, qualquer coisa.")
+    print(f"Pressione {BOLD}Enter{RESET} quando terminar (ou aguarde o silêncio).\n")
+
+    input(f"  [{BOLD}Enter para começar a gravar{RESET}]")
+    print(f"\n{BOLD}{GREEN}● GRAVANDO — fale agora…{RESET}", flush=True)
+
+    voice_buf     = bytearray()
+    last_speech_t = time.time()
+    stop_event    = threading.Event()
+
+    def _stdin_stop():
+        input()
+        stop_event.set()
+    threading.Thread(target=_stdin_stop, daemon=True).start()
+
+    while not stop_event.is_set():
+        data  = stream.read(BLOCK_SIZE, exception_on_overflow=False)
+        level = rms(data)
+        voice_buf.extend(data)
+        bar = "█" * min(int(level / 400), 20)
+        print(f"\r{PURPLE}🎙 {bar:<20}{RESET} {int(level):4.0f}  ", end="", flush=True)
+        if level > SILENCE_RMS:
+            last_speech_t = time.time()
+        elif time.time() - last_speech_t > 4.0 and len(voice_buf) > SAMPLERATE * 3:
+            print(f"\n{GRAY}[silêncio detectado — encerrando gravação]{RESET}")
+            break
+
+    print(f"\n{GRAY}Transcrevendo…{RESET}")
+
+    stream.stop_stream()
+    stream.close()
+    pa.terminate()
+
+    print(f"Carregando Whisper [{whisper_model}]…")
+    from faster_whisper import WhisperModel
+    model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
+
+    transcribed = transcribe(model, bytes(voice_buf), lang,
+                             noise_profile=noise_samples)
+
+    if not transcribed:
+        print(f"{YELLOW}Não foi possível transcrever. Tente falar mais perto do microfone.{RESET}")
+        transcribed = DEFAULT_PROMPTS[lang]
+
+    print(f"\n{PURPLE}Transcrição captada:{RESET}")
+    print(f"  {transcribed}\n")
+
+    profile = {
+        "lang":           lang,
+        "model":          whisper_model,
+        "device":         device,
+        "initial_prompt": transcribed,
+        "noise_rms":      float(noise_rms),
+    }
+    save_profile(profile)
+
+    print(f"{GREEN}✓ Perfil salvo em {PROFILE_FILE}{RESET}")
+    print(f"{GRAY}  Na próxima execução, será carregado automaticamente.{RESET}\n")
+    print("Para recalibrar a qualquer momento: python3 listen.py --calibrate")
+
+
+# ── Helpers de UI ─────────────────────────────────────────────────────────────
 
 def notify(title: str, body: str):
     try:
@@ -86,14 +277,12 @@ def notify(title: str, body: str):
 
 
 def get_active_window() -> tuple:
-    """Captura janela focada via python-xlib direto — sem subprocess, sem sleep."""
     try:
         from Xlib import display as xdisplay, X
-        dpy  = xdisplay.Display()
-        win  = dpy.get_input_focus().focus
+        dpy = xdisplay.Display()
+        win = dpy.get_input_focus().focus
         if win in (X.PointerRoot, X.NONE):
             return "", "?"
-        # Sobe até a janela toplevel (que tem WM_NAME)
         while True:
             name = win.get_wm_name()
             if name:
@@ -107,21 +296,17 @@ def get_active_window() -> tuple:
         return "", "?"
 
 
-def xdotype(text: str, window_id: str | None = None, clipboard: bool = True):
-    """Cola texto na janela focada via clipboard (padrão) ou xdotool type."""
+def xdotype(text: str, clipboard: bool = True):
     if clipboard:
         try:
             subprocess.run(["xclip", "-selection", "clipboard"],
                            input=text.encode(), check=True)
             time.sleep(0.08)
-            # Ctrl+Shift+V na janela focada AGORA — sem precisar de window ID
             subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
                            check=True)
             return
         except Exception as e:
             print(f"{YELLOW}clipboard falhou ({e}), tentando type…{RESET}")
-
-    # Fallback: xdotool type sem window ID (janela focada no momento)
     cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text]
     try:
         subprocess.run(cmd, check=True)
@@ -141,35 +326,6 @@ def ask_claude_print(text: str, is_first: bool):
     print(f"{YELLOW}─────────────────────────────{RESET}")
     subprocess.run(cmd, text=True)
     print(f"{YELLOW}─────────────────────────────{RESET}\n")
-
-
-INITIAL_PROMPTS = {
-    "pt": "Transcrição em português brasileiro com acentuação correta:",
-    "en": "Transcription in English:",
-    "es": "Transcripción en español con acentuación correcta:",
-}
-
-def transcribe(model, audio_bytes: bytes, lang: str) -> str:
-    """Converte bytes PCM int16 → float32, normaliza e transcreve com Whisper."""
-    if not audio_bytes:
-        return ""
-    samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-    # Normaliza volume — mic fraco produz sinal muito baixo
-    peak = np.abs(samples).max()
-    if peak > 0.001:
-        samples = samples / peak * 0.95
-
-    segments, _ = model.transcribe(
-        samples,
-        language=LANG_WHISPER.get(lang, lang),
-        initial_prompt=INITIAL_PROMPTS.get(lang, ""),
-        vad_filter=False,              # desligado: VAD corta fala de mic ruim
-        beam_size=5,
-        condition_on_previous_text=False,  # evita alucinações em blocos curtos
-        temperature=0,                 # determinístico
-    )
-    return " ".join(s.text.strip() for s in segments).strip()
 
 
 def toggle_armed(lang_ref: list):
@@ -262,12 +418,19 @@ def start_stdin_toggle(lang_ref: list):
 # ── Loop principal ────────────────────────────────────────────────────────────
 
 def run(device: int, initial_lang: str, silence: float, confirm: bool,
-        preload: bool, print_mode: bool, clipboard: bool, whisper_model: str):
+        print_mode: bool, clipboard: bool, whisper_model: str,
+        noise_profile: np.ndarray | None, initial_prompt: str):
 
     print(f"Carregando Whisper [{whisper_model}] …")
     from faster_whisper import WhisperModel
     model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
-    print(f"{GREEN}Pronto.{RESET}")
+
+    if noise_profile is not None:
+        print(f"{GREEN}✓ Perfil de ruído carregado{RESET}")
+    if initial_prompt:
+        preview = initial_prompt[:60] + ("…" if len(initial_prompt) > 60 else "")
+        print(f"{GREEN}✓ Perfil de voz: \"{preview}\"{RESET}")
+    print()
 
     pa     = pyaudio.PyAudio()
     stream = pa.open(
@@ -300,24 +463,26 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
         print(f"{GRAY}PID: {os.getpid()} | Ctrl+C para encerrar{RESET}\n")
 
     is_first      = True
-    audio_buf     = bytearray()   # acumula PCM enquanto armado
+    audio_buf     = bytearray()
     last_speech_t = None
     was_armed     = False
     vol_chars     = " ▁▂▃▄▅▆▇█"
+
+    def do_transcribe(buf: bytes) -> str:
+        return transcribe(model, buf, lang_ref[0],
+                          noise_profile=noise_profile,
+                          initial_prompt=initial_prompt)
 
     def send_text(text: str):
         nonlocal is_first
         if not text:
             return
-        lang = lang_ref[0]
-        # Verifica troca de idioma
         target = SWITCH_TARGETS.get(text.lower().rstrip(".!?"))
         if target:
             if target != lang_ref[0]:
                 lang_ref[0] = target
                 print(f"\n{GREEN}⇄  Idioma: {LANG_LABELS[target]}{RESET}\n")
             return
-
         if confirm:
             print(f"\nEnviar: \"{text}\" ? [Enter=sim / texto=editar / n=descartar] ", end="", flush=True)
             ans = input()
@@ -326,7 +491,6 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
                 return
             if ans.strip():
                 text = ans.strip()
-
         if print_mode:
             ask_claude_print(text, is_first)
             is_first = False
@@ -342,11 +506,10 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             with armed_lock:
                 cur_armed = armed
 
-            # Transição desarmado → transcrevendo e enviando
             if was_armed and not cur_armed:
                 print(f"\r{' '*60}\r", end="", flush=True)
                 if audio_buf:
-                    text = transcribe(model, bytes(audio_buf), lang_ref[0])
+                    text = do_transcribe(bytes(audio_buf))
                     audio_buf.clear()
                     last_speech_t = None
                     if text:
@@ -362,26 +525,22 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             if not cur_armed:
                 continue
 
-            # Acumula áudio
             audio_buf.extend(data)
 
-            # Indicador de volume em tempo real
             level = rms(data)
             if level > SILENCE_RMS:
                 last_speech_t = time.time()
                 bar_idx = min(int(level / 500), len(vol_chars) - 1)
-                bar = vol_chars[bar_idx] * 8
-                print(f"\r{PURPLE}🎙 {bar}{RESET} {int(level):4.0f}  ", end="", flush=True)
+                print(f"\r{PURPLE}🎙 {vol_chars[bar_idx]*8}{RESET} {int(level):4.0f}  ", end="", flush=True)
             else:
                 print(f"\r{GRAY}🎙 {'·'*8}{RESET}       ", end="", flush=True)
 
-            # Auto-envio por silêncio prolongado (enquanto armado)
             if (last_speech_t and
                     time.time() - last_speech_t > silence and
-                    len(audio_buf) > SAMPLERATE * 0.5):  # mínimo 0.5s de áudio
+                    len(audio_buf) > SAMPLERATE * 0.5):
                 print(f"\r{' '*60}\r", end="", flush=True)
                 print(f"{GRAY}[silêncio — transcrevendo…]{RESET}")
-                text = transcribe(model, bytes(audio_buf), lang_ref[0])
+                text = do_transcribe(bytes(audio_buf))
                 audio_buf.clear()
                 last_speech_t = None
                 if text:
@@ -404,51 +563,67 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Voz → janela focada | faster-whisper | Linux/X11",
+        description="Voz → janela focada | faster-whisper + noisereduce | Linux/X11",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Modelos Whisper (CPU):
-  tiny   ~0.6s latência  (padrão — boa qualidade, rápido)
-  small  ~2.8s latência  (melhor qualidade, mais lento)
+Primeira vez:
+  python3 listen.py --calibrate       # calibra mic e voz (~2 min)
 
-Exemplos:
-  python3 listen.py                        # pt-BR, modelo tiny
-  python3 listen.py --model small          # mais preciso
-  python3 listen.py --lang en              # inglês
-  python3 listen.py --clipboard            # cola via Ctrl+Shift+V
-  python3 listen.py --confirm              # pede confirmação antes de digitar
-  python3 listen.py --print                # envia para claude --print
-  python3 listen.py --list-devices
+Uso normal:
+  python3 listen.py                   # carrega perfil salvo automaticamente
+  python3 listen.py --model small     # melhor precisão (~5s latência)
+  python3 listen.py --lang en         # inglês
+  python3 listen.py --no-profile      # ignora perfil salvo
+  python3 listen.py --list-devices    # lista microfones
         """,
     )
-    ap.add_argument("--lang",         default="pt", choices=["pt","en","es"])
-    ap.add_argument("--model",        default="tiny", choices=["tiny","small"],
-                    help="Modelo Whisper: tiny (rápido) ou small (mais preciso)")
-    ap.add_argument("--device",       type=int,   default=DEVICE_INDEX)
-    ap.add_argument("--silence",      type=float, default=SILENCE_SECS,
-                    help=f"Segundos de silêncio para auto-enviar (padrão: {SILENCE_SECS})")
+    ap.add_argument("--calibrate",    action="store_true",
+                    help="Calibra perfil de ruído e voz para este microfone/ambiente")
+    ap.add_argument("--lang",         default=None, choices=["pt","en","es"],
+                    help="Idioma (padrão: do perfil salvo, ou pt)")
+    ap.add_argument("--model",        default=None, choices=["tiny","small"],
+                    help="Modelo Whisper (padrão: do perfil salvo, ou tiny)")
+    ap.add_argument("--device",       type=int,   default=None,
+                    help=f"Índice do microfone (padrão: do perfil salvo, ou {DEVICE_INDEX})")
+    ap.add_argument("--silence",      type=float, default=SILENCE_SECS)
     ap.add_argument("--confirm",      action="store_true")
     ap.add_argument("--print",        dest="print_mode", action="store_true")
     ap.add_argument("--clipboard",    action="store_true",
-                    help="Cola via xclip+Ctrl+Shift+V (melhor para TUIs)")
-    ap.add_argument("--preload-all",  action="store_true", help=argparse.SUPPRESS)
+                    help="Cola via xclip+Ctrl+Shift+V")
+    ap.add_argument("--no-profile",   action="store_true",
+                    help="Ignora perfil salvo, usa padrões")
     ap.add_argument("--list-devices", action="store_true")
-    ap.add_argument("--list-models",  action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args.list_devices:
         list_devices()
         return
 
+    # Carrega perfil salvo (se existir e --no-profile não for passado)
+    profile = {} if args.no_profile else load_profile()
+    if profile:
+        print(f"{GRAY}Perfil carregado: {PROFILE_FILE}{RESET}")
+
+    lang          = args.lang   or profile.get("lang",   "pt")
+    whisper_model = args.model  or profile.get("model",  "tiny")
+    device        = args.device if args.device is not None else profile.get("device", DEVICE_INDEX)
+    initial_prompt = profile.get("initial_prompt", "")
+    noise_profile  = None if args.no_profile else load_noise_profile()
+
+    if args.calibrate:
+        calibrate(device=device, lang=lang, whisper_model=whisper_model)
+        return
+
     run(
-        device        = args.device,
-        initial_lang  = args.lang,
-        silence       = args.silence,
-        confirm       = args.confirm,
-        preload       = args.preload_all,
-        print_mode    = args.print_mode,
-        clipboard     = args.clipboard,
-        whisper_model = args.model,
+        device         = device,
+        initial_lang   = lang,
+        silence        = args.silence,
+        confirm        = args.confirm,
+        print_mode     = args.print_mode,
+        clipboard      = args.clipboard,
+        whisper_model  = whisper_model,
+        noise_profile  = noise_profile,
+        initial_prompt = initial_prompt,
     )
 
 
