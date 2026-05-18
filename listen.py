@@ -55,9 +55,10 @@ SWITCH_TARGETS = {
 }
 
 # ── Estado global ────────────────────────────────────────────────────────────
-armed         = False
-armed_lock    = threading.Lock()
-target_window = None   # ID da janela capturada no momento do armar
+armed              = False
+armed_lock         = threading.Lock()
+target_window      = None   # ID da janela capturada no momento do armar
+target_window_name = ""
 
 RED    = "\033[31m"
 GREEN  = "\033[32m"
@@ -79,17 +80,38 @@ def notify(title: str, body: str):
         pass
 
 
-def get_active_window() -> str | None:
-    """Retorna o ID da janela atualmente focada, ou None se falhar."""
+def get_active_window() -> tuple[str, str]:
+    """Retorna (window_id, window_name) da janela focada."""
     try:
-        r = subprocess.run(["xdotool", "getactivewindow"],
+        # Pequena pausa para o X11 estabilizar após o XGrabKey
+        time.sleep(0.05)
+        r = subprocess.run(["xdotool", "getactivewindow", "getwindowname"],
                            capture_output=True, text=True, check=True)
-        return r.stdout.strip()
+        lines = r.stdout.strip().splitlines()
+        wid   = lines[0] if lines else ""
+        name  = lines[1] if len(lines) > 1 else "?"
+        return wid, name
     except Exception:
-        return None
+        return "", "?"
 
 
-def xdotype(text: str, window_id: str | None = None):
+def xdotype(text: str, window_id: str | None = None, clipboard: bool = False):
+    """Digita texto na janela alvo via xdotool type ou paste de clipboard."""
+    if clipboard:
+        # Coloca no clipboard e simula Ctrl+Shift+V (paste em terminal)
+        try:
+            subprocess.run(["xclip", "-selection", "clipboard"],
+                           input=text.encode(), check=True)
+            time.sleep(0.05)
+            cmd = ["xdotool", "key", "--clearmodifiers"]
+            if window_id:
+                cmd += ["--window", window_id]
+            cmd.append("ctrl+shift+v")
+            subprocess.run(cmd, check=True)
+            return
+        except Exception as e:
+            print(f"{YELLOW}clipboard fallback falhou ({e}), tentando type…{RESET}")
+
     cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "20"]
     if window_id:
         cmd += ["--window", window_id]
@@ -115,17 +137,17 @@ def ask_claude_print(text: str, is_first: bool):
 
 
 def toggle_armed(lang_ref: list):
-    global armed, target_window
+    global armed, target_window, target_window_name
     with armed_lock:
         armed = not armed
         new_val = armed
     label = LANG_LABELS.get(lang_ref[0], lang_ref[0])
     if new_val:
-        # Captura a janela focada AGORA, antes de qualquer output no terminal
-        target_window = get_active_window()
-        win_info = f" [win:{target_window}]" if target_window else ""
-        print(f"\n{BOLD}{GREEN}● ARMADO [{label}]{win_info} — fale agora{RESET}", flush=True)
-        notify("🎙 Ouvindo", f"Idioma: {label}")
+        wid, wname = get_active_window()
+        target_window      = wid
+        target_window_name = wname
+        print(f"\n{BOLD}{GREEN}● ARMADO [{label}]{RESET} → {CYAN}{wname}{RESET} (id:{wid})", flush=True)
+        notify("🎙 Ouvindo", f"{label} → {wname}")
     else:
         target_window = None
         print(f"\n{GRAY}○ Desarmado{RESET}", flush=True)
@@ -219,7 +241,7 @@ def start_stdin_toggle(lang_ref: list):
 # ── Loop principal de áudio ──────────────────────────────────────────────────
 
 def run(device: int, initial_lang: str, silence: float, confirm: bool,
-        preload: bool, print_mode: bool):
+        preload: bool, print_mode: bool, clipboard: bool = False):
 
     langs = list(MODELS.keys()) if preload else [initial_lang]
     missing = [l for l in langs if not os.path.isdir(MODELS[l])]
@@ -303,9 +325,9 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
                         is_first = False
                     else:
                         win = target_window
-                        win_info = f" → win:{win}" if win else " → janela ativa"
-                        print(f"{CYAN}↳ digitando{win_info}: {final}{RESET}")
-                        xdotype(final, win)
+                        wname = target_window_name or "janela ativa"
+                        print(f"{CYAN}↳ → {wname}: {final}{RESET}")
+                        xdotype(final, win, clipboard)
 
             was_armed = cur_armed
 
@@ -403,6 +425,8 @@ Exemplos:
     ap.add_argument("--silence",      type=float, default=SILENCE_SECS)
     ap.add_argument("--confirm",      action="store_true")
     ap.add_argument("--print",        dest="print_mode", action="store_true")
+    ap.add_argument("--clipboard",    action="store_true",
+                    help="Cola via xclip+Ctrl+Shift+V em vez de xdotool type (melhor para TUIs)")
     ap.add_argument("--preload-all",  action="store_true")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--list-models",  action="store_true")
@@ -429,6 +453,7 @@ Exemplos:
         confirm      = args.confirm,
         preload      = args.preload_all,
         print_mode   = args.print_mode,
+        clipboard    = args.clipboard,
     )
 
 
