@@ -24,6 +24,8 @@ import threading
 import pyaudio
 import numpy as np
 
+os.environ.setdefault("PYSTRAY_BACKEND", "gtk")
+
 PID_FILE    = "/tmp/listen.pid"
 PROFILE_DIR = os.path.expanduser("~/.config/listentomecli")
 PROFILE_FILE = os.path.join(PROFILE_DIR, "profile.json")
@@ -66,6 +68,8 @@ armed              = False
 armed_lock         = threading.Lock()
 target_window      = None
 target_window_name = ""
+tray_icon          = None
+_base_img          = None
 
 RED    = "\033[31m"
 GREEN  = "\033[32m"
@@ -328,16 +332,175 @@ def ask_claude_print(text: str, is_first: bool):
     print(f"{YELLOW}─────────────────────────────{RESET}\n")
 
 
+# ── System tray ───────────────────────────────────────────────────────────────
+
+def find_asset(name: str) -> str | None:
+    candidates = [
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", name),
+        os.path.join(PROFILE_DIR, "assets", name),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _load_base_image():
+    global _base_img
+    if _base_img is not None:
+        return _base_img
+    path = find_asset("icone-ai-listen-to-me-on-cli.png")
+    if path is None:
+        return None
+    try:
+        from PIL import Image
+        _base_img = Image.open(path).convert("RGBA").resize((64, 64), Image.LANCZOS)
+        return _base_img
+    except Exception:
+        return None
+
+
+def make_tray_image(recording: bool):
+    base = _load_base_image()
+    try:
+        from PIL import Image, ImageDraw
+        if base is None:
+            img = Image.new("RGBA", (64, 64), (30, 30, 30, 255))
+            draw = ImageDraw.Draw(img)
+            color = (220, 50, 50, 255) if recording else (60, 180, 60, 255)
+            draw.ellipse([8, 8, 56, 56], fill=color)
+            return img
+        img = base.copy()
+        if recording:
+            overlay = Image.new("RGBA", img.size, (220, 50, 50, 110))
+            img = Image.alpha_composite(img, overlay)
+            draw = ImageDraw.Draw(img)
+            draw.ellipse([46, 2, 62, 18], fill=(220, 50, 50, 255),
+                         outline=(255, 255, 255, 200), width=1)
+        return img
+    except Exception:
+        return None
+
+
+def _build_argv(lang: str, model: str, clipboard: bool) -> list:
+    script = os.path.realpath(__file__)
+    argv = [sys.executable, script, f"--lang={lang}", f"--model={model}"]
+    if clipboard:
+        argv.append("--clipboard")
+    return argv
+
+
+def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
+    try:
+        import pystray
+        from pystray import Menu, MenuItem
+    except ImportError:
+        print(f"{GRAY}pystray não encontrado — tray desativado (pip install pystray){RESET}")
+        return
+
+    img = make_tray_image(recording=False)
+    if img is None:
+        return
+
+    def _set_lang(lang: str):
+        def _action(icon, item):
+            lang_ref[0] = lang
+            print(f"\n{GREEN}⇄  Idioma: {LANG_LABELS[lang]}{RESET}\n")
+            notify("Idioma alterado", LANG_LABELS[lang])
+            icon.update_menu()
+        return _action
+
+    def _set_model(m: str):
+        def _action(icon, item):
+            if model_ref[0] != m:
+                model_ref[0] = m
+                notify("Modelo", f"Reiniciando com {m}…")
+                icon.stop()
+                os.execv(sys.executable, _build_argv(lang_ref[0], m, clipboard_ref[0]))
+        return _action
+
+    def _calibrate(icon, item):
+        script = os.path.realpath(__file__)
+        try:
+            subprocess.Popen([
+                "x-terminal-emulator", "-e",
+                f"{sys.executable} {script} --calibrate --lang {lang_ref[0]}",
+            ])
+        except FileNotFoundError:
+            try:
+                subprocess.Popen([
+                    "bash", "-c",
+                    f"xterm -e '{sys.executable} {script} --calibrate --lang {lang_ref[0]}'",
+                ])
+            except Exception:
+                notify("Calibrar", f"Execute no terminal: listentomecli --calibrate")
+
+    def _restart(icon, item):
+        icon.stop()
+        os.execv(sys.executable, _build_argv(lang_ref[0], model_ref[0], clipboard_ref[0]))
+
+    def _quit(icon, item):
+        icon.stop()
+        try:
+            os.remove(PID_FILE)
+        except Exception:
+            pass
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    def _status_label(item):
+        state = "● Gravando" if armed else "○ Aguardando"
+        return f"{state}  [{lang_ref[0].upper()} · {model_ref[0]}]"
+
+    menu = Menu(
+        MenuItem(_status_label, None, enabled=False),
+        Menu.SEPARATOR,
+        MenuItem("Calibrar microfone", _calibrate),
+        MenuItem("Modelo", Menu(
+            MenuItem("tiny  — rápido (~1s)",
+                     _set_model("tiny"),
+                     checked=lambda item: model_ref[0] == "tiny",
+                     radio=True),
+            MenuItem("small — preciso (~5s)",
+                     _set_model("small"),
+                     checked=lambda item: model_ref[0] == "small",
+                     radio=True),
+        )),
+        MenuItem("Idioma", Menu(
+            MenuItem("Português (Brasil)", _set_lang("pt"),
+                     checked=lambda item: lang_ref[0] == "pt", radio=True),
+            MenuItem("English (US)",       _set_lang("en"),
+                     checked=lambda item: lang_ref[0] == "en", radio=True),
+            MenuItem("Español",            _set_lang("es"),
+                     checked=lambda item: lang_ref[0] == "es", radio=True),
+        )),
+        Menu.SEPARATOR,
+        MenuItem("Reiniciar", _restart),
+        MenuItem("Sair", _quit),
+    )
+
+    global tray_icon
+    tray_icon = pystray.Icon("listentomecli", img, "ListenToMeOnCLI", menu)
+    tray_icon.run_detached()
+
+
 def toggle_armed(lang_ref: list):
-    global armed, target_window, target_window_name
+    global armed, target_window, target_window_name, tray_icon
     with armed_lock:
         armed = not armed
         new_val = armed
     label = LANG_LABELS.get(lang_ref[0], lang_ref[0])
     if new_val:
+        if tray_icon:
+            img = make_tray_image(recording=True)
+            if img:
+                tray_icon.icon = img
         print(f"\n{BOLD}{GREEN}● GRAVANDO [{label}]{RESET} — fale agora, mude de janela à vontade", flush=True)
         notify("🎙 Gravando", label)
     else:
+        if tray_icon:
+            img = make_tray_image(recording=False)
+            if img:
+                tray_icon.icon = img
         # Capture the focused window NOW — this is where the text will be typed
         wid, wname = get_active_window()
         target_window      = wid
@@ -420,7 +583,12 @@ def start_stdin_toggle(lang_ref: list):
 
 def run(device: int, initial_lang: str, silence: float, confirm: bool,
         print_mode: bool, clipboard: bool, whisper_model: str,
-        noise_profile: np.ndarray | None, initial_prompt: str):
+        noise_profile: np.ndarray | None, initial_prompt: str,
+        model_ref: list | None = None):
+
+    if model_ref is None:
+        model_ref = [whisper_model]
+    clipboard_ref = [clipboard]
 
     print(f"Carregando Whisper [{whisper_model}] …")
     from faster_whisper import WhisperModel
@@ -448,6 +616,9 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
     signal.signal(signal.SIGUSR1, lambda s, f: toggle_armed(lang_ref))
+
+    if not print_mode:
+        start_tray(lang_ref, model_ref, clipboard_ref)
 
     if print_mode:
         global armed

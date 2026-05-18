@@ -12,6 +12,10 @@ mkdir -p "$HOME/.local/bin"
 cp "$SCRIPT_DIR/listen.py" "$BIN"
 chmod +x "$BIN"
 
+echo "==> Copiando assets para ~/.config/listentomecli/assets/"
+mkdir -p "$HOME/.config/listentomecli/assets"
+cp -r "$SCRIPT_DIR/assets/"* "$HOME/.config/listentomecli/assets/"
+
 echo "==> Instalando unit file em $SERVICE"
 mkdir -p "$SERVICE_DIR"
 cp "$SCRIPT_DIR/listen.service" "$SERVICE"
