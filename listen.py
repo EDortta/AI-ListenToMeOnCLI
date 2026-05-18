@@ -55,8 +55,9 @@ SWITCH_TARGETS = {
 }
 
 # ── Estado global ────────────────────────────────────────────────────────────
-armed      = False
-armed_lock = threading.Lock()
+armed         = False
+armed_lock    = threading.Lock()
+target_window = None   # ID da janela capturada no momento do armar
 
 RED    = "\033[31m"
 GREEN  = "\033[32m"
@@ -78,12 +79,23 @@ def notify(title: str, body: str):
         pass
 
 
-def xdotype(text: str):
+def get_active_window() -> str | None:
+    """Retorna o ID da janela atualmente focada, ou None se falhar."""
     try:
-        subprocess.run(
-            ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text],
-            check=True
-        )
+        r = subprocess.run(["xdotool", "getactivewindow"],
+                           capture_output=True, text=True, check=True)
+        return r.stdout.strip()
+    except Exception:
+        return None
+
+
+def xdotype(text: str, window_id: str | None = None):
+    cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "20"]
+    if window_id:
+        cmd += ["--window", window_id]
+    cmd += ["--", text]
+    try:
+        subprocess.run(cmd, check=True)
     except FileNotFoundError:
         print(f"{RED}xdotool não encontrado: sudo apt install xdotool{RESET}")
         print(f"{CYAN}Texto: {text}{RESET}")
@@ -103,15 +115,19 @@ def ask_claude_print(text: str, is_first: bool):
 
 
 def toggle_armed(lang_ref: list):
-    global armed
+    global armed, target_window
     with armed_lock:
         armed = not armed
         new_val = armed
     label = LANG_LABELS.get(lang_ref[0], lang_ref[0])
     if new_val:
-        print(f"\n{BOLD}{GREEN}● ARMADO [{label}] — fale agora{RESET}", flush=True)
+        # Captura a janela focada AGORA, antes de qualquer output no terminal
+        target_window = get_active_window()
+        win_info = f" [win:{target_window}]" if target_window else ""
+        print(f"\n{BOLD}{GREEN}● ARMADO [{label}]{win_info} — fale agora{RESET}", flush=True)
         notify("🎙 Ouvindo", f"Idioma: {label}")
     else:
+        target_window = None
         print(f"\n{GRAY}○ Desarmado{RESET}", flush=True)
         notify("🔇 Mudo", "")
 
@@ -328,8 +344,10 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
                     ask_claude_print(final, is_first)
                     is_first = False
                 else:
-                    print(f"{CYAN}↳ digitando: {final}{RESET}")
-                    xdotype(final)
+                    win = target_window
+                    win_info = f" → win:{win}" if win else " → janela ativa"
+                    print(f"{CYAN}↳ digitando{win_info}: {final}{RESET}")
+                    xdotype(final, win)
 
     except KeyboardInterrupt:
         print(f"\n{GRAY}Encerrando…{RESET}")
