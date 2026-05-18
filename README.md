@@ -37,19 +37,49 @@ O Whisper recebe o bloco de áudio inteiro ao invés de processar palavra por pa
 
 ```bash
 # Pacotes de sistema
-sudo apt-get install -y xdotool python3-pyaudio portaudio19-dev
+sudo apt-get install -y xdotool xclip python3-pyaudio portaudio19-dev
 
 # Pacotes Python
-pip install faster-whisper pyaudio python-xlib
+pip install faster-whisper pyaudio python-xlib noisereduce
 ```
 
 > `faster-whisper` baixa os modelos automaticamente na primeira execução (~150 MB para `tiny`, ~480 MB para `small`).
+
+### Instalação como serviço (recomendado)
+
+Inicia automaticamente com a sessão gráfica, sem precisar de terminal aberto:
+
+```bash
+bash install.sh
+```
+
+Após instalar, gerencie com:
+
+```bash
+systemctl --user status listen        # status
+systemctl --user stop listen          # parar
+systemctl --user start listen         # iniciar
+journalctl --user -u listen -f        # logs em tempo real
+systemctl --user disable listen       # remover do autostart
+```
+
+### Calibração (recomendado na primeira vez)
+
+```bash
+listentomecli --calibrate
+```
+
+Fase 1 (3s): fica em silêncio → captura ruído ambiente.
+Fase 2 (15s): fale normalmente → calibra seu perfil de voz.
+
+O perfil é salvo em `~/.config/listentomecli/` e usado automaticamente em todas as sessões seguintes.
 
 ### Uso
 
 ```bash
 # Inicia com modelo tiny (padrão — rápido, boa qualidade)
-python3 listen.py
+listentomecli
+python3 listen.py   # equivalente, sem instalar como serviço
 
 # Modelo small: melhor precisão de acentuação, ~3s de latência por bloco
 python3 listen.py --model small
@@ -124,6 +154,8 @@ Fale a frase enquanto gravando:
 --clipboard          Cola via xclip+Ctrl+Shift+V (melhor para TUIs)
 --print              Modo legado: envia para `claude --print`
 --list-devices       Lista microfones e sai
+--calibrate          Calibra microfone e voz, salva perfil em ~/.config/listentomecli/
+--no-profile         Ignora perfil salvo para esta sessão
 ```
 
 ---
@@ -138,13 +170,42 @@ Fale a frase enquanto gravando:
 
 ```bash
 # System packages
-sudo apt-get install -y xdotool python3-pyaudio portaudio19-dev
+sudo apt-get install -y xdotool xclip python3-pyaudio portaudio19-dev
 
 # Python packages
-pip install faster-whisper pyaudio python-xlib
+pip install faster-whisper pyaudio python-xlib noisereduce
 ```
 
 > `faster-whisper` downloads models automatically on first run (~150 MB for `tiny`, ~480 MB for `small`).
+
+### Install as a service (recommended)
+
+Starts automatically with the desktop session — no terminal required:
+
+```bash
+bash install.sh
+```
+
+Manage with:
+
+```bash
+systemctl --user status listen        # status
+systemctl --user stop listen          # stop
+systemctl --user start listen         # start
+journalctl --user -u listen -f        # live logs
+systemctl --user disable listen       # remove from autostart
+```
+
+### Calibration (recommended on first run)
+
+```bash
+listentomecli --calibrate
+```
+
+Phase 1 (3s): stay silent → captures ambient noise profile.
+Phase 2 (15s): speak normally → calibrates your voice profile.
+
+Profile is saved to `~/.config/listentomecli/` and applied automatically from then on.
 
 ### How it works
 
@@ -161,16 +222,17 @@ Unlike streaming solutions (VOSK), Whisper receives the entire audio block at on
 ### Usage
 
 ```bash
-python3 listen.py                  # pt-BR, tiny model
-python3 listen.py --lang en        # English
-python3 listen.py --model small    # better accuracy, ~5s latency
-python3 listen.py --clipboard      # paste via Ctrl+Shift+V (better for TUIs)
-python3 listen.py --list-devices   # list microphones
+listentomecli                      # pt-BR, tiny model (when installed as service, already running)
+listentomecli --lang en            # English
+listentomecli --model small        # better accuracy, ~5s latency
+listentomecli --list-devices       # list microphones
 ```
 
 ### Multi-window workflow
 
-1. Run `python3 listen.py` (minimize or leave in a side terminal).
+When running as a service, it's already listening in the background.
+
+1. (If not a service) run `listentomecli` in any terminal.
 2. **Click** the destination window (Claude CLI, Cursor, Codex, browser…).
 3. Press **Ctrl+Space** → shows `● RECORDING → <window name>` + desktop notification.
 4. Speak your full message at a natural pace.
@@ -209,11 +271,40 @@ python3 listen.py --list-devices   # list microphones
 
 ```bash
 # Paquetes de sistema
-sudo apt-get install -y xdotool python3-pyaudio portaudio19-dev
+sudo apt-get install -y xdotool xclip python3-pyaudio portaudio19-dev
 
 # Paquetes Python
-pip install faster-whisper pyaudio python-xlib
+pip install faster-whisper pyaudio python-xlib noisereduce
 ```
+
+### Instalar como servicio (recomendado)
+
+Se inicia automáticamente con la sesión gráfica, sin necesidad de terminal abierta:
+
+```bash
+bash install.sh
+```
+
+Gestionar con:
+
+```bash
+systemctl --user status listen        # estado
+systemctl --user stop listen          # detener
+systemctl --user start listen         # iniciar
+journalctl --user -u listen -f        # logs en tiempo real
+systemctl --user disable listen       # quitar del autostart
+```
+
+### Calibración (recomendado la primera vez)
+
+```bash
+listentomecli --calibrate
+```
+
+Fase 1 (3s): quédate en silencio → captura el perfil de ruido ambiente.
+Fase 2 (15s): habla normalmente → calibra tu perfil de voz.
+
+El perfil se guarda en `~/.config/listentomecli/` y se aplica automáticamente en las sesiones siguientes.
 
 ### Cómo funciona
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=ListenToMeOnCLI — voice input for any X11 window
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/listentomecli
+Restart=on-failure
+RestartSec=3
+
+# Inherit the graphical session environment (DISPLAY, DBUS, PULSE, XAUTHORITY)
+Environment=HOME=%h
+PassEnvironment=DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS PULSE_SERVER XDG_RUNTIME_DIR
+
+[Install]
+WantedBy=default.target
