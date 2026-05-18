@@ -617,25 +617,13 @@ def _set_tray_state(state: str):
 
 
 def _start_blink():
-    """Blink tray icon to signal pending-paste state."""
-    if _GLib is None or _xapp_icon is None:
-        return
-    _blink_state[0] = False
-    def _tick():
-        if _xapp_icon is None:
-            return False
-        _blink_state[0] = not _blink_state[0]
-        name = "media-record" if _blink_state[0] else "audio-input-microphone"
-        _xapp_icon.set_icon_name(name)
-        return True  # keep repeating
-    _blink_timer[0] = _GLib.timeout_add(500, _tick)
+    """Show steady 'pending' icon — no animation."""
+    _set_tray_state("paused")
 
 
 def _stop_blink():
-    """Stop blinking and restore idle icon."""
-    if _GLib is None:
-        return
-    if _blink_timer[0] is not None:
+    """Restore idle icon after pending paste."""
+    if _blink_timer[0] is not None and _GLib is not None:
         _GLib.source_remove(_blink_timer[0])
         _blink_timer[0] = None
     _set_tray_state("idle")
