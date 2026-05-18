@@ -24,7 +24,25 @@ import threading
 import pyaudio
 import numpy as np
 
-os.environ.setdefault("PYSTRAY_BACKEND", "gtk")
+# Prefer AppIndicator (MATE/Ubuntu) over plain GTK StatusIcon (deprecated/hidden in modern DEs)
+def _best_pystray_backend() -> str:
+    try:
+        import gi
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3  # noqa: F401
+        return "appindicator"
+    except Exception:
+        pass
+    try:
+        import gi
+        gi.require_version("AppIndicator3", "0.1")
+        from gi.repository import AppIndicator3  # noqa: F401
+        return "appindicator"
+    except Exception:
+        pass
+    return "gtk"
+
+os.environ.setdefault("PYSTRAY_BACKEND", _best_pystray_backend())
 
 PID_FILE    = "/tmp/listen.pid"
 PROFILE_DIR = os.path.expanduser("~/.config/listentomecli")
@@ -480,7 +498,13 @@ def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
 
     global tray_icon
     tray_icon = pystray.Icon("listentomecli", img, "ListenToMeOnCLI", menu)
-    tray_icon.run_detached()
+    try:
+        tray_icon.run_detached()
+        print(f"{GREEN}✓ Tray iniciado (backend: {os.environ.get('PYSTRAY_BACKEND', '?')}){RESET}",
+              flush=True)
+    except Exception as e:
+        print(f"{YELLOW}Tray falhou: {e}{RESET}", flush=True)
+        tray_icon = None
 
 
 def toggle_armed(lang_ref: list):
