@@ -86,12 +86,23 @@ def notify(title: str, body: str):
 
 
 def get_active_window() -> tuple:
+    """Captura janela focada via python-xlib direto — sem subprocess, sem sleep."""
     try:
-        time.sleep(0.05)
-        r = subprocess.run(["xdotool", "getactivewindow", "getwindowname"],
-                           capture_output=True, text=True, check=True)
-        lines = r.stdout.strip().splitlines()
-        return (lines[0] if lines else ""), (lines[1] if len(lines) > 1 else "?")
+        from Xlib import display as xdisplay, X
+        dpy  = xdisplay.Display()
+        win  = dpy.get_input_focus().focus
+        if win in (X.PointerRoot, X.NONE):
+            return "", "?"
+        # Sobe até a janela toplevel (que tem WM_NAME)
+        while True:
+            name = win.get_wm_name()
+            if name:
+                return str(win.id), str(name)
+            parent = win.query_tree().parent
+            if parent == dpy.screen().root or parent is None:
+                break
+            win = parent
+        return str(win.id), "?"
     except Exception:
         return "", "?"
 
@@ -156,14 +167,14 @@ def toggle_armed(lang_ref: list):
         new_val = armed
     label = LANG_LABELS.get(lang_ref[0], lang_ref[0])
     if new_val:
-        print(f"\n{BOLD}{GREEN}● GRAVANDO [{label}]{RESET} — fale agora, mude de janela à vontade", flush=True)
-        notify("🎙 Gravando", label)
-    else:
         wid, wname = get_active_window()
         target_window      = wid
         target_window_name = wname
-        print(f"\n{GRAY}○ Parado — transcrevendo → {CYAN}{wname}{RESET}", flush=True)
-        notify("⏳ Transcrevendo…", wname)
+        print(f"\n{BOLD}{GREEN}● GRAVANDO [{label}]{RESET} → {CYAN}{wname}{RESET} — fale e mude de janela à vontade", flush=True)
+        notify("🎙 Gravando", f"{label} → {wname}")
+    else:
+        print(f"\n{GRAY}○ Parado — transcrevendo…{RESET}", flush=True)
+        notify("⏳ Transcrevendo…", target_window_name)
 
 
 def list_devices():
