@@ -82,7 +82,11 @@ DEFAULT_PROMPTS = {
 }
 
 # ── Estado global ─────────────────────────────────────────────────────────────
+# States: IDLE (armed=False) → RECORDING (armed=True, paused=False)
+#                            ↔ PAUSED    (armed=True, paused=True)
+#         RECORDING/PAUSED  → IDLE via Ctrl+Space (send) or Ctrl+Esc (cancel)
 armed              = False
+recording_paused   = False
 armed_lock         = threading.Lock()
 target_window      = None
 target_window_name = ""
@@ -378,22 +382,28 @@ def _load_base_image():
         return None
 
 
-def make_tray_image(recording: bool):
+def make_tray_image(state: str = "idle"):
+    """state: 'idle' | 'recording' | 'paused'"""
     base = _load_base_image()
     try:
         from PIL import Image, ImageDraw
+        colors = {
+            "recording": ((220, 50,  50,  110), (220, 50,  50,  255)),
+            "paused":    ((220, 160,  0,  110), (220, 160,  0,  255)),
+        }
         if base is None:
             img = Image.new("RGBA", (64, 64), (30, 30, 30, 255))
             draw = ImageDraw.Draw(img)
-            color = (220, 50, 50, 255) if recording else (60, 180, 60, 255)
-            draw.ellipse([8, 8, 56, 56], fill=color)
+            dot = {"recording": (220,50,50,255), "paused": (220,160,0,255)}.get(state, (60,180,60,255))
+            draw.ellipse([8, 8, 56, 56], fill=dot)
             return img
         img = base.copy()
-        if recording:
-            overlay = Image.new("RGBA", img.size, (220, 50, 50, 110))
+        if state in colors:
+            overlay_color, dot_color = colors[state]
+            overlay = Image.new("RGBA", img.size, overlay_color)
             img = Image.alpha_composite(img, overlay)
             draw = ImageDraw.Draw(img)
-            draw.ellipse([46, 2, 62, 18], fill=(220, 50, 50, 255),
+            draw.ellipse([46, 2, 62, 18], fill=dot_color,
                          outline=(255, 255, 255, 200), width=1)
         return img
     except Exception:
@@ -416,7 +426,7 @@ def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
         print(f"{GRAY}pystray não encontrado — tray desativado (pip install pystray){RESET}")
         return
 
-    img = make_tray_image(recording=False)
+    img = make_tray_image("idle")
     if img is None:
         return
 
@@ -466,7 +476,12 @@ def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
         os.kill(os.getpid(), signal.SIGTERM)
 
     def _status_label(item):
-        state = "● Gravando" if armed else "○ Aguardando"
+        if armed and recording_paused:
+            state = "⏸ Pausado"
+        elif armed:
+            state = "● Gravando"
+        else:
+            state = "○ Aguardando"
         return f"{state}  [{lang_ref[0].upper()} · {model_ref[0]}]"
 
     menu = Menu(
@@ -507,30 +522,72 @@ def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
         tray_icon = None
 
 
+def _set_tray_state(state: str):
+    if tray_icon:
+        img = make_tray_image(state)
+        if img:
+            tray_icon.icon = img
+
+
 def toggle_armed(lang_ref: list):
-    global armed, target_window, target_window_name, tray_icon
+    """Ctrl+Space: start session (IDLE→RECORDING) or send (RECORDING/PAUSED→IDLE)."""
+    global armed, recording_paused, target_window, target_window_name
     with armed_lock:
         armed = not armed
         new_val = armed
+        if not new_val:
+            recording_paused = False
     label = LANG_LABELS.get(lang_ref[0], lang_ref[0])
     if new_val:
-        if tray_icon:
-            img = make_tray_image(recording=True)
-            if img:
-                tray_icon.icon = img
-        print(f"\n{BOLD}{GREEN}● GRAVANDO [{label}]{RESET} — fale agora, mude de janela à vontade", flush=True)
+        _set_tray_state("recording")
+        print(f"\n{BOLD}{GREEN}● GRAVANDO [{label}]{RESET}"
+              f"  {GRAY}Ctrl+Shift+Space = pausar | Ctrl+Esc = cancelar{RESET}", flush=True)
         notify("🎙 Gravando", label)
     else:
-        if tray_icon:
-            img = make_tray_image(recording=False)
-            if img:
-                tray_icon.icon = img
-        # Capture the focused window NOW — this is where the text will be typed
+        _set_tray_state("idle")
         wid, wname = get_active_window()
         target_window      = wid
         target_window_name = wname
-        print(f"\n{GRAY}○ Parado — transcrevendo → {CYAN}{wname}{RESET}", flush=True)
+        print(f"\n{GRAY}○ Enviando → {CYAN}{wname}{RESET}", flush=True)
         notify("⏳ Transcrevendo…", wname)
+
+
+def toggle_paused(lang_ref: list):
+    """Ctrl+Shift+Space: pause/resume within an active session."""
+    global recording_paused
+    with armed_lock:
+        if not armed:
+            return
+        recording_paused = not recording_paused
+        is_paused = recording_paused
+    label = LANG_LABELS.get(lang_ref[0], lang_ref[0])
+    if is_paused:
+        _set_tray_state("paused")
+        print(f"\n{BOLD}{YELLOW}⏸ PAUSADO [{label}]{RESET}"
+              f"  {GRAY}Ctrl+Shift+Space = retomar | Ctrl+Space = enviar{RESET}", flush=True)
+        notify("⏸ Pausado", "Ctrl+Shift+Space para retomar")
+    else:
+        _set_tray_state("recording")
+        print(f"\n{BOLD}{GREEN}● GRAVANDO [{label}]{RESET}"
+              f"  {GRAY}(retomado — buffer acumulando){RESET}", flush=True)
+        notify("🎙 Retomado", label)
+
+
+_cancel_flag = [False]   # shared between cancel_session() and the audio loop
+
+
+def cancel_session():
+    """Ctrl+Esc: discard buffer and return to IDLE."""
+    global armed, recording_paused
+    with armed_lock:
+        was_armed = armed
+        armed            = False
+        recording_paused = False
+    if was_armed:
+        _cancel_flag[0] = True
+        _set_tray_state("idle")
+        print(f"\n{GRAY}✗ Sessão cancelada — buffer descartado{RESET}", flush=True)
+        notify("✗ Cancelado", "Buffer descartado")
 
 
 def list_devices():
@@ -554,21 +611,32 @@ def start_xlib_hotkey(lang_ref: list) -> bool:
 
         dpy  = xdisplay.Display()
         root = dpy.screen().root
-        code = dpy.keysym_to_keycode(XK.string_to_keysym("space"))
+
+        code_space = dpy.keysym_to_keycode(XK.string_to_keysym("space"))
+        code_esc   = dpy.keysym_to_keycode(XK.string_to_keysym("Escape"))
+
+        # Extra modifier variants to handle NumLock / CapsLock transparently
+        _extra = [0, X.Mod2Mask, X.LockMask, X.Mod2Mask | X.LockMask]
+
+        combos = [
+            # (keycode, base_mods)
+            (code_space, X.ControlMask),                    # Ctrl+Space  → start/send
+            (code_space, X.ControlMask | X.ShiftMask),      # Ctrl+Shift+Space → pause/resume
+            (code_esc,   X.ControlMask),                    # Ctrl+Esc → cancel
+        ]
 
         grabbed = False
-        for mod in [X.ControlMask,
-                    X.ControlMask | X.Mod2Mask,
-                    X.ControlMask | X.LockMask,
-                    X.ControlMask | X.Mod2Mask | X.LockMask]:
-            try:
-                root.grab_key(code, mod, False, X.GrabModeAsync, X.GrabModeAsync)
-                grabbed = True
-            except BadAccess:
-                pass
+        for code, base in combos:
+            for extra in _extra:
+                try:
+                    root.grab_key(code, base | extra, False,
+                                  X.GrabModeAsync, X.GrabModeAsync)
+                    grabbed = True
+                except BadAccess:
+                    pass
 
         if not grabbed:
-            print(f"{YELLOW}XGrabKey: Ctrl+Space já está em uso por outro app{RESET}")
+            print(f"{YELLOW}XGrabKey: teclas já em uso por outro app{RESET}")
             return False
 
         dpy.flush()
@@ -576,8 +644,16 @@ def start_xlib_hotkey(lang_ref: list) -> bool:
         def _loop():
             while True:
                 ev = dpy.next_event()
-                if ev.type == X.KeyPress:
+                if ev.type != X.KeyPress:
+                    continue
+                state = ev.state & (X.ControlMask | X.ShiftMask | X.Mod1Mask)
+                sym   = dpy.keycode_to_keysym(ev.detail, 0)
+                if sym == XK.XK_space and (state & X.ShiftMask):
+                    toggle_paused(lang_ref)
+                elif sym == XK.XK_space:
                     toggle_armed(lang_ref)
+                elif sym == XK.XK_Escape:
+                    cancel_session()
 
         t = threading.Thread(target=_loop, daemon=True)
         t.start()
@@ -653,7 +729,9 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
         hotkey_ok = start_xlib_hotkey(lang_ref)
         start_stdin_toggle(lang_ref)
         if hotkey_ok:
-            print(f"{BOLD}Ctrl+Space{RESET} para gravar/transcrever")
+            print(f"{BOLD}Ctrl+Space{RESET}       → gravar / enviar")
+            print(f"{BOLD}Ctrl+Shift+Space{RESET} → pausar / retomar (buffer acumula)")
+            print(f"{BOLD}Ctrl+Esc{RESET}          → cancelar e descartar")
         else:
             print(f"{YELLOW}Ctrl+Space indisponível{RESET} — use Enter neste terminal ou kill -USR1 $(cat {PID_FILE})")
         print(f"{GRAY}PID: {os.getpid()} | Ctrl+C para encerrar{RESET}\n")
@@ -700,11 +778,15 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             data = stream.read(BLOCK_SIZE, exception_on_overflow=False)
 
             with armed_lock:
-                cur_armed = armed
+                cur_armed  = armed
+                cur_paused = recording_paused
 
+            # Session ended (Ctrl+Space to send, or cancel_session)
             if was_armed and not cur_armed:
                 print(f"\r{' '*60}\r", end="", flush=True)
-                if audio_buf:
+                cancelled = _cancel_flag[0]
+                _cancel_flag[0] = False
+                if audio_buf and not cancelled:
                     text = do_transcribe(bytes(audio_buf))
                     audio_buf.clear()
                     last_speech_t = None
@@ -714,22 +796,28 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
                     else:
                         print(f"{GRAY}(nada reconhecido){RESET}")
                 else:
-                    print(f"{GRAY}(sem áudio gravado){RESET}")
+                    audio_buf.clear()
+                    last_speech_t = None
+                    if not cancelled:
+                        print(f"{GRAY}(sem áudio gravado){RESET}")
 
             was_armed = cur_armed
 
-            if not cur_armed:
+            if not cur_armed or cur_paused:
                 continue
 
             audio_buf.extend(data)
 
             level = rms(data)
+            buf_secs = len(audio_buf) / (SAMPLERATE * 2)
             if level > SILENCE_RMS:
                 last_speech_t = time.time()
                 bar_idx = min(int(level / 500), len(vol_chars) - 1)
-                print(f"\r{PURPLE}🎙 {vol_chars[bar_idx]*8}{RESET} {int(level):4.0f}  ", end="", flush=True)
+                print(f"\r{PURPLE}🎙 {vol_chars[bar_idx]*8}{RESET} {int(level):4.0f}"
+                      f"  {GRAY}{buf_secs:.0f}s{RESET}  ", end="", flush=True)
             else:
-                print(f"\r{GRAY}🎙 {'·'*8}{RESET}       ", end="", flush=True)
+                print(f"\r{GRAY}🎙 {'·'*8}{RESET}      "
+                      f"  {GRAY}{buf_secs:.0f}s{RESET}  ", end="", flush=True)
 
             if (last_speech_t and
                     time.time() - last_speech_t > silence and
