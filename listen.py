@@ -720,7 +720,8 @@ def _do_restart(lang: str, model: str, clipboard: bool):
     return False
 
 
-def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
+def init_tray(lang_ref: list, model_ref: list, clipboard_ref: list) -> bool:
+    """Initialize GTK/XApp tray icon. Must be called from the main thread. Returns True on success."""
     global tray_icon, _GLib, _xapp_icon
     try:
         import gi
@@ -730,7 +731,7 @@ def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
         _GLib = GLib
     except Exception as e:
         print(f"{GRAY}XApp não disponível — tray desativado ({e}){RESET}", flush=True)
-        return
+        return False
 
     _install_icons()
     menu = _build_gtk_menu(lang_ref, model_ref, clipboard_ref)
@@ -740,19 +741,16 @@ def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
     si.set_icon_name(_ICON_NAMES.get("idle", "audio-input-microphone"))
     si.set_tooltip_text("ListenToMeOnCLI")
     si.set_visible(True)
+    print(f"{GRAY}[tray] StatusIcon set_visible(True) — thread={threading.current_thread().name}{RESET}",
+          flush=True)
     if menu:
         si.set_secondary_menu(menu)
 
     _xapp_icon = si
-    tray_icon   = si   # keep shared reference for _set_tray_state
-
-    def _loop():
-        Gtk.main()
-
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
-    time.sleep(0.3)
-    print(f"{GREEN}✓ Tray iniciado (XApp){RESET}", flush=True)
+    tray_icon  = si
+    print(f"{GREEN}✓ Tray inicializado (XApp) — GTK main loop será iniciado na thread principal{RESET}",
+          flush=True)
+    return True
 
 
 def _set_tray_state(state: str):
@@ -760,6 +758,9 @@ def _set_tray_state(state: str):
         return
     name = _ICON_NAMES.get(state)
     if name:
+        if state != _last_tray_state[0]:
+            _last_tray_state[0] = state
+            print(f"{GRAY}[tray] {state} ({name}){RESET}", flush=True)
         _GLib.idle_add(_xapp_icon.set_icon_name, name)
 
 
@@ -774,6 +775,16 @@ def _stop_blink():
         _GLib.source_remove(_blink_timer[0])
         _blink_timer[0] = None
     _set_tray_state("idle")
+
+
+def _quit_gtk():
+    """Stop GTK main loop — safe to call from any thread via GLib.idle_add."""
+    try:
+        from gi.repository import Gtk
+        Gtk.main_quit()
+    except Exception:
+        pass
+    return False
 
 
 def toggle_armed(lang_ref: list):
@@ -847,6 +858,7 @@ _transcribing_flag = [False]   # True while auto-stop transcription runs (blocks
 _blink_timer       = [None]    # GLib timeout handle for pending-state blink
 _blink_state       = [False]   # current blink phase
 _send_fn           = [None]    # send_text callable, injected by run()
+_last_tray_state   = [None]    # last known tray state for change-only logging
 REC_LIMIT_SECS     = 30        # max active (non-paused) recording seconds per session
 
 
@@ -970,11 +982,21 @@ def start_stdin_toggle(lang_ref: list):
 def run(device: int, initial_lang: str, silence: float, confirm: bool,
         print_mode: bool, clipboard: bool, whisper_model: str,
         noise_profile: np.ndarray | None, initial_prompt: str,
-        model_ref: list | None = None):
+        model_ref: list | None = None,
+        lang_ref: list | None = None,
+        clipboard_ref: list | None = None):
+    """Audio capture + transcription loop.
 
+    When called from a worker thread (tray initialized externally), lang_ref,
+    model_ref, and clipboard_ref must be passed in so they are shared with the
+    GTK tray. When called directly (print_mode or no tray), they are created here.
+    """
     if model_ref is None:
         model_ref = [whisper_model]
-    clipboard_ref = [clipboard]
+    if lang_ref is None:
+        lang_ref = [initial_lang]
+    if clipboard_ref is None:
+        clipboard_ref = [clipboard]
 
     print(f"Carregando Whisper [{whisper_model}] …")
     from faster_whisper import WhisperModel
@@ -997,14 +1019,8 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
         frames_per_buffer=BLOCK_SIZE,
     )
 
-    lang_ref = [initial_lang]
-
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
-    signal.signal(signal.SIGUSR1, lambda s, f: toggle_armed(lang_ref))
-
-    if not print_mode:
-        start_tray(lang_ref, model_ref, clipboard_ref)
 
     if print_mode:
         global armed
@@ -1172,6 +1188,9 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             os.remove(PID_FILE)
         except Exception:
             pass
+        # Signal GTK main loop to stop (no-op if tray was not initialized)
+        if _GLib is not None:
+            _GLib.idle_add(_quit_gtk)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -1229,7 +1248,14 @@ Uso normal:
         calibrate(device=device, lang=lang, whisper_model=whisper_model)
         return
 
-    run(
+    model_ref     = [whisper_model]
+    lang_ref      = [lang]
+    clipboard_ref = [args.clipboard]
+
+    # Signal handlers must be registered in the main thread
+    signal.signal(signal.SIGUSR1, lambda s, f: toggle_armed(lang_ref))
+
+    run_kwargs = dict(
         device         = device,
         initial_lang   = lang,
         silence        = args.silence,
@@ -1239,7 +1265,50 @@ Uso normal:
         whisper_model  = whisper_model,
         noise_profile  = noise_profile,
         initial_prompt = initial_prompt,
+        model_ref      = model_ref,
+        lang_ref       = lang_ref,
+        clipboard_ref  = clipboard_ref,
     )
+
+    if args.print_mode:
+        # Print mode: no tray, run audio loop directly in main thread
+        run(**run_kwargs)
+        return
+
+    tray_ok = init_tray(lang_ref, model_ref, clipboard_ref)
+
+    if tray_ok:
+        # GTK main loop must run in the main thread; audio runs in a worker thread
+        audio_thread = threading.Thread(
+            target=run,
+            kwargs=run_kwargs,
+            daemon=True,
+            name="audio-worker",
+        )
+        audio_thread.start()
+
+        try:
+            import gi
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk, GLib
+
+            # Let Python signal handlers fire inside Gtk.main() (standard pattern)
+            GLib.timeout_add(200, lambda: True)
+
+            def _sigterm(sig, frame):
+                GLib.idle_add(_quit_gtk)
+            signal.signal(signal.SIGTERM, _sigterm)
+
+            print(f"{GRAY}[tray] GTK main loop iniciado — thread={threading.current_thread().name}{RESET}",
+                  flush=True)
+            Gtk.main()
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(f"{RED}GTK main loop erro: {e}{RESET}", flush=True)
+    else:
+        # Tray unavailable: run audio loop directly in main thread (no tray)
+        run(**run_kwargs)
 
 
 if __name__ == "__main__":
