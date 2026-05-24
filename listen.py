@@ -200,6 +200,67 @@ def transcribe(model, audio_bytes: bytes, lang: str,
 
 # ── Calibração ────────────────────────────────────────────────────────────────
 
+# Reference texts for accuracy test — public domain, ~15s at normal reading pace
+_ACCURACY_TEXTS = {
+    "pt": (
+        "Era uma noite de verão. Eu vinha no bonde, de volta para casa, "
+        "quando ouvi dois homens discutindo ao meu lado. "
+        "A questão era de somenos, mas animada."
+    ),
+    "en": (
+        "Alice was beginning to get very tired of sitting by her sister on the bank, "
+        "and of having nothing to do. "
+        "Once or twice she had peeped into the book her sister was reading."
+    ),
+    "es": (
+        "En un lugar de la Mancha, de cuyo nombre no quiero acordarme, "
+        "no ha mucho tiempo que vivía un hidalgo de los de lanza en astillero, "
+        "adarga antigua y rocín flaco."
+    ),
+}
+
+
+def _word_accuracy(reference: str, hypothesis: str) -> tuple[float, list]:
+    """Return (accuracy_0_to_1, aligned_pairs) using word-level edit distance."""
+    import unicodedata
+    def _norm(s):
+        s = unicodedata.normalize("NFD", s.lower())
+        s = "".join(c for c in s if unicodedata.category(c) != "Mn")  # strip accents
+        return "".join(c if c.isalnum() or c == " " else " " for c in s).split()
+
+    ref = _norm(reference)
+    hyp = _norm(hypothesis)
+    n, m = len(ref), len(hyp)
+
+    # Wagner-Fischer DP for edit distance
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1): dp[i][0] = i
+    for j in range(m + 1): dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if ref[i-1] == hyp[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+            else:
+                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+
+    errors = dp[n][m]
+    accuracy = max(0.0, 1.0 - errors / max(n, 1))
+
+    # Backtrack to build aligned pairs for display
+    pairs, i, j = [], n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and ref[i-1] == hyp[j-1]:
+            pairs.append(("ok", ref[i-1], hyp[j-1])); i -= 1; j -= 1
+        elif j > 0 and (i == 0 or dp[i][j-1] <= dp[i-1][j] and dp[i][j-1] <= dp[i-1][j-1]):
+            pairs.append(("ins", "", hyp[j-1])); j -= 1
+        elif i > 0 and (j == 0 or dp[i-1][j] <= dp[i][j-1] and dp[i-1][j] <= dp[i-1][j-1]):
+            pairs.append(("del", ref[i-1], "")); i -= 1
+        else:
+            pairs.append(("sub", ref[i-1], hyp[j-1])); i -= 1; j -= 1
+    pairs.reverse()
+    return accuracy, pairs
+
+
 def calibrate(device: int, lang: str, whisper_model: str):
     print(f"\n{BOLD}=== CALIBRAÇÃO ==={RESET}")
     print(f"Microfone: device {device} | Idioma: {LANG_LABELS[lang]} | Modelo: {whisper_model}\n")
@@ -289,7 +350,93 @@ def calibrate(device: int, lang: str, whisper_model: str):
 
     print(f"{GREEN}✓ Perfil salvo em {PROFILE_FILE}{RESET}")
     print(f"{GRAY}  Na próxima execução, será carregado automaticamente.{RESET}\n")
-    print("Para recalibrar a qualquer momento: python3 listen.py --calibrate")
+
+    # ── Etapa 3: teste de acurácia ────────────────────────────────────────────
+    ref_text = _ACCURACY_TEXTS.get(lang)
+    if not ref_text:
+        print("Para recalibrar a qualquer momento: listentomecli --calibrate")
+        return
+
+    print(f"{BOLD}Etapa 3/3 — Teste de acurácia{RESET}")
+    print("Leia o texto abaixo em voz normal (≈15 segundos).")
+    print("Pressione Enter quando terminar.\n")
+    print(f"  {BOLD}┌─ Leia isto: ──────────────────────────────────────────────┐{RESET}")
+    for line in ref_text.split(". "):
+        print(f"  {BOLD}│{RESET}  {line.strip()}.")
+    print(f"  {BOLD}└───────────────────────────────────────────────────────────┘{RESET}\n")
+
+    pa2    = pyaudio.PyAudio()
+    stm2   = pa2.open(format=pyaudio.paInt16, channels=1, rate=SAMPLERATE,
+                      input=True, input_device_index=device,
+                      frames_per_buffer=BLOCK_SIZE)
+
+    input(f"  [{BOLD}Enter para começar{RESET}]")
+    print(f"\n{BOLD}{GREEN}● LENDO — pode começar…{RESET}", flush=True)
+
+    acc_buf     = bytearray()
+    last_sph    = time.time()
+    stop_ev2    = threading.Event()
+
+    def _stop2():
+        input()
+        stop_ev2.set()
+    threading.Thread(target=_stop2, daemon=True).start()
+
+    while not stop_ev2.is_set():
+        data  = stm2.read(BLOCK_SIZE, exception_on_overflow=False)
+        level = rms(data)
+        acc_buf.extend(data)
+        bar = "█" * min(int(level / 400), 20)
+        print(f"\r{PURPLE}🎙 {bar:<20}{RESET} {int(level):4.0f}  "
+              f"{GRAY}{len(acc_buf)/(SAMPLERATE*2):.0f}s{RESET}  ", end="", flush=True)
+        if level > SILENCE_RMS:
+            last_sph = time.time()
+        elif time.time() - last_sph > 3.0 and len(acc_buf) > SAMPLERATE * 3:
+            print(f"\n{GRAY}[silêncio — encerrando]{RESET}")
+            break
+
+    stm2.stop_stream(); stm2.close(); pa2.terminate()
+    print(f"\n{GRAY}Transcrevendo para comparação…{RESET}")
+
+    hyp = transcribe(model, bytes(acc_buf), lang, noise_profile=noise_samples,
+                     initial_prompt="")  # sem initial_prompt para medir o Whisper puro
+
+    accuracy, pairs = _word_accuracy(ref_text, hyp)
+    pct = accuracy * 100
+
+    print(f"\n{BOLD}Resultado:{RESET}")
+    print(f"  Texto reconhecido: {CYAN}{hyp or '(nada)'}{RESET}")
+    print()
+
+    # Word-level diff
+    diff_line = []
+    for kind, ref_w, hyp_w in pairs:
+        if kind == "ok":
+            diff_line.append(f"{GREEN}{ref_w}{RESET}")
+        elif kind == "sub":
+            diff_line.append(f"{RED}[{ref_w}→{hyp_w}]{RESET}")
+        elif kind == "del":
+            diff_line.append(f"{RED}[−{ref_w}]{RESET}")
+        else:  # ins
+            diff_line.append(f"{YELLOW}[+{hyp_w}]{RESET}")
+    print("  " + " ".join(diff_line))
+    print()
+
+    bar_len = 30
+    filled  = int(pct / 100 * bar_len)
+    bar_str = "█" * filled + "░" * (bar_len - filled)
+    color   = GREEN if pct >= 85 else YELLOW if pct >= 60 else RED
+    print(f"  {color}{BOLD}Acurácia: {pct:.0f}%  [{bar_str}]{RESET}")
+
+    if pct >= 85:
+        print(f"  {GREEN}Ótimo! O microfone está bem calibrado para este idioma.{RESET}")
+    elif pct >= 60:
+        print(f"  {YELLOW}Razoável. Fale mais devagar ou use --model small para mais precisão.{RESET}")
+    else:
+        print(f"  {RED}Baixo. Verifique o microfone, reduza o ruído ambiente, ou use --model small.{RESET}")
+
+    print()
+    print("Para recalibrar a qualquer momento: listentomecli --calibrate")
 
 
 # ── Helpers de UI ─────────────────────────────────────────────────────────────
@@ -573,7 +720,8 @@ def _do_restart(lang: str, model: str, clipboard: bool):
     return False
 
 
-def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
+def init_tray(lang_ref: list, model_ref: list, clipboard_ref: list) -> bool:
+    """Initialize GTK/XApp tray icon. Must be called from the main thread. Returns True on success."""
     global tray_icon, _GLib, _xapp_icon
     try:
         import gi
@@ -583,7 +731,7 @@ def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
         _GLib = GLib
     except Exception as e:
         print(f"{GRAY}XApp não disponível — tray desativado ({e}){RESET}", flush=True)
-        return
+        return False
 
     _install_icons()
     menu = _build_gtk_menu(lang_ref, model_ref, clipboard_ref)
@@ -593,19 +741,16 @@ def start_tray(lang_ref: list, model_ref: list, clipboard_ref: list):
     si.set_icon_name(_ICON_NAMES.get("idle", "audio-input-microphone"))
     si.set_tooltip_text("ListenToMeOnCLI")
     si.set_visible(True)
+    print(f"{GRAY}[tray] StatusIcon set_visible(True) — thread={threading.current_thread().name}{RESET}",
+          flush=True)
     if menu:
         si.set_secondary_menu(menu)
 
     _xapp_icon = si
-    tray_icon   = si   # keep shared reference for _set_tray_state
-
-    def _loop():
-        Gtk.main()
-
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
-    time.sleep(0.3)
-    print(f"{GREEN}✓ Tray iniciado (XApp){RESET}", flush=True)
+    tray_icon  = si
+    print(f"{GREEN}✓ Tray inicializado (XApp) — GTK main loop será iniciado na thread principal{RESET}",
+          flush=True)
+    return True
 
 
 def _set_tray_state(state: str):
@@ -613,6 +758,9 @@ def _set_tray_state(state: str):
         return
     name = _ICON_NAMES.get(state)
     if name:
+        if state != _last_tray_state[0]:
+            _last_tray_state[0] = state
+            print(f"{GRAY}[tray] {state} ({name}){RESET}", flush=True)
         _GLib.idle_add(_xapp_icon.set_icon_name, name)
 
 
@@ -627,6 +775,16 @@ def _stop_blink():
         _GLib.source_remove(_blink_timer[0])
         _blink_timer[0] = None
     _set_tray_state("idle")
+
+
+def _quit_gtk():
+    """Stop GTK main loop — safe to call from any thread via GLib.idle_add."""
+    try:
+        from gi.repository import Gtk
+        Gtk.main_quit()
+    except Exception:
+        pass
+    return False
 
 
 def toggle_armed(lang_ref: list):
@@ -700,6 +858,7 @@ _transcribing_flag = [False]   # True while auto-stop transcription runs (blocks
 _blink_timer       = [None]    # GLib timeout handle for pending-state blink
 _blink_state       = [False]   # current blink phase
 _send_fn           = [None]    # send_text callable, injected by run()
+_last_tray_state   = [None]    # last known tray state for change-only logging
 REC_LIMIT_SECS     = 30        # max active (non-paused) recording seconds per session
 
 
@@ -823,11 +982,21 @@ def start_stdin_toggle(lang_ref: list):
 def run(device: int, initial_lang: str, silence: float, confirm: bool,
         print_mode: bool, clipboard: bool, whisper_model: str,
         noise_profile: np.ndarray | None, initial_prompt: str,
-        model_ref: list | None = None):
+        model_ref: list | None = None,
+        lang_ref: list | None = None,
+        clipboard_ref: list | None = None):
+    """Audio capture + transcription loop.
 
+    When called from a worker thread (tray initialized externally), lang_ref,
+    model_ref, and clipboard_ref must be passed in so they are shared with the
+    GTK tray. When called directly (print_mode or no tray), they are created here.
+    """
     if model_ref is None:
         model_ref = [whisper_model]
-    clipboard_ref = [clipboard]
+    if lang_ref is None:
+        lang_ref = [initial_lang]
+    if clipboard_ref is None:
+        clipboard_ref = [clipboard]
 
     print(f"Carregando Whisper [{whisper_model}] …")
     from faster_whisper import WhisperModel
@@ -850,14 +1019,8 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
         frames_per_buffer=BLOCK_SIZE,
     )
 
-    lang_ref = [initial_lang]
-
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
-    signal.signal(signal.SIGUSR1, lambda s, f: toggle_armed(lang_ref))
-
-    if not print_mode:
-        start_tray(lang_ref, model_ref, clipboard_ref)
 
     if print_mode:
         global armed
@@ -1025,6 +1188,9 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
             os.remove(PID_FILE)
         except Exception:
             pass
+        # Signal GTK main loop to stop (no-op if tray was not initialized)
+        if _GLib is not None:
+            _GLib.idle_add(_quit_gtk)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -1082,7 +1248,14 @@ Uso normal:
         calibrate(device=device, lang=lang, whisper_model=whisper_model)
         return
 
-    run(
+    model_ref     = [whisper_model]
+    lang_ref      = [lang]
+    clipboard_ref = [args.clipboard]
+
+    # Signal handlers must be registered in the main thread
+    signal.signal(signal.SIGUSR1, lambda s, f: toggle_armed(lang_ref))
+
+    run_kwargs = dict(
         device         = device,
         initial_lang   = lang,
         silence        = args.silence,
@@ -1092,7 +1265,50 @@ Uso normal:
         whisper_model  = whisper_model,
         noise_profile  = noise_profile,
         initial_prompt = initial_prompt,
+        model_ref      = model_ref,
+        lang_ref       = lang_ref,
+        clipboard_ref  = clipboard_ref,
     )
+
+    if args.print_mode:
+        # Print mode: no tray, run audio loop directly in main thread
+        run(**run_kwargs)
+        return
+
+    tray_ok = init_tray(lang_ref, model_ref, clipboard_ref)
+
+    if tray_ok:
+        # GTK main loop must run in the main thread; audio runs in a worker thread
+        audio_thread = threading.Thread(
+            target=run,
+            kwargs=run_kwargs,
+            daemon=True,
+            name="audio-worker",
+        )
+        audio_thread.start()
+
+        try:
+            import gi
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk, GLib
+
+            # Let Python signal handlers fire inside Gtk.main() (standard pattern)
+            GLib.timeout_add(200, lambda: True)
+
+            def _sigterm(sig, frame):
+                GLib.idle_add(_quit_gtk)
+            signal.signal(signal.SIGTERM, _sigterm)
+
+            print(f"{GRAY}[tray] GTK main loop iniciado — thread={threading.current_thread().name}{RESET}",
+                  flush=True)
+            Gtk.main()
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(f"{RED}GTK main loop erro: {e}{RESET}", flush=True)
+    else:
+        # Tray unavailable: run audio loop directly in main thread (no tray)
+        run(**run_kwargs)
 
 
 if __name__ == "__main__":
