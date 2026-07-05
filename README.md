@@ -108,7 +108,7 @@ O perfil é salvo em `~/.config/listentomecli/` e usado automaticamente em todas
 
 **Se Ctrl+Space não funcionar** (outro app com o grab):
 - Pressione **Enter** no terminal do listen.py
-- `kill -USR1 $(cat /tmp/listen.pid)` de qualquer terminal
+- `kill -USR1 $(cat "${XDG_RUNTIME_DIR:-$HOME/.config/listentomecli}"/listentomecli.pid)` de qualquer terminal
 
 ### Fluxo típico com pausa
 
@@ -251,7 +251,7 @@ Profile is saved to `~/.config/listentomecli/` and applied automatically from th
 
 **Ctrl+Space fallbacks:**
 - Press **Enter** in the listentomecli terminal
-- `kill -USR1 $(cat /tmp/listen.pid)` from any terminal
+- `kill -USR1 $(cat "${XDG_RUNTIME_DIR:-$HOME/.config/listentomecli}"/listentomecli.pid)` from any terminal
 
 ### Typical pause workflow
 
@@ -385,7 +385,7 @@ El perfil se guarda en `~/.config/listentomecli/` y se aplica automáticamente e
 
 **Fallbacks para Ctrl+Space:**
 - Presiona **Enter** en la terminal de listentomecli
-- `kill -USR1 $(cat /tmp/listen.pid)` desde cualquier terminal
+- `kill -USR1 $(cat "${XDG_RUNTIME_DIR:-$HOME/.config/listentomecli}"/listentomecli.pid)` desde cualquier terminal
 
 ### Flujo típico con pausa
 

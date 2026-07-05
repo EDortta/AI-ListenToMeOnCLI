@@ -8,7 +8,7 @@ Uso básico:
   python3 listen.py --calibrate   # calibra microfone e voz (faça primeiro)
   python3 listen.py               # usa perfil salvo, Ctrl+Space para gravar
 
-Toggle: Ctrl+Space | Enter neste terminal | kill -USR1 $(cat /tmp/listen.pid)
+Toggle: Ctrl+Space | Enter neste terminal | kill -USR1 $(cat "${XDG_RUNTIME_DIR:-$HOME/.config/listentomecli}"/listentomecli.pid)
 """
 
 import argparse
@@ -44,10 +44,22 @@ def _best_pystray_backend() -> str:
 
 os.environ.setdefault("PYSTRAY_BACKEND", _best_pystray_backend())
 
-PID_FILE    = "/tmp/listen.pid"
 PROFILE_DIR = os.path.expanduser("~/.config/listentomecli")
 PROFILE_FILE = os.path.join(PROFILE_DIR, "profile.json")
 NOISE_FILE   = os.path.join(PROFILE_DIR, "noise_profile.npy")
+
+
+def _pid_file_path() -> str:
+    # Private per-user directory instead of world-writable /tmp (CWE-59/CWE-377):
+    # a predictable path in /tmp lets another local user pre-plant a symlink.
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir and os.path.isdir(runtime_dir):
+        return os.path.join(runtime_dir, "listentomecli.pid")
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    return os.path.join(PROFILE_DIR, "listen.pid")
+
+
+PID_FILE = _pid_file_path()
 
 SAMPLERATE   = 16000
 BLOCK_SIZE   = 1024
@@ -1019,7 +1031,10 @@ def run(device: int, initial_lang: str, silence: float, confirm: bool,
         frames_per_buffer=BLOCK_SIZE,
     )
 
-    with open(PID_FILE, "w") as f:
+    # O_NOFOLLOW: refuse to follow a symlink planted at PID_FILE by another
+    # local user (relevant if XDG_RUNTIME_DIR/PROFILE_DIR fall back to /tmp).
+    pid_fd = os.open(PID_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(pid_fd, "w") as f:
         f.write(str(os.getpid()))
 
     if print_mode:
