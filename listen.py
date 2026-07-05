@@ -498,14 +498,28 @@ def get_active_window() -> tuple:
         return "", "?"
 
 
+KEEP_CLIPBOARD = False  # set from --keep-clipboard in main()
+
+
 def xdotype(text: str, clipboard: bool = True):
     if clipboard:
         try:
+            prev_clip = None
+            if not KEEP_CLIPBOARD:
+                prev = subprocess.run(["xclip", "-selection", "clipboard", "-o"],
+                                       capture_output=True, check=False)
+                prev_clip = prev.stdout if prev.returncode == 0 else b""
             subprocess.run(["xclip", "-selection", "clipboard"],
                            input=text.encode(), check=True)
             time.sleep(0.08)
             subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
                            check=True)
+            if not KEEP_CLIPBOARD:
+                # Give the paste time to complete before wiping the dictated
+                # text — it stays readable in clipboard managers otherwise.
+                time.sleep(0.15)
+                subprocess.run(["xclip", "-selection", "clipboard"],
+                               input=prev_clip, check=False)
             return
         except Exception as e:
             print(f"{YELLOW}clipboard falhou ({e}), tentando type…{RESET}")
@@ -1239,10 +1253,15 @@ Uso normal:
     ap.add_argument("--print",        dest="print_mode", action="store_true")
     ap.add_argument("--clipboard",    action="store_true",
                     help="Cola via xclip+Ctrl+Shift+V")
+    ap.add_argument("--keep-clipboard", action="store_true",
+                    help="Não restaura o clipboard após colar (padrão: restaura o conteúdo anterior)")
     ap.add_argument("--no-profile",   action="store_true",
                     help="Ignora perfil salvo, usa padrões")
     ap.add_argument("--list-devices", action="store_true")
     args = ap.parse_args()
+
+    global KEEP_CLIPBOARD
+    KEEP_CLIPBOARD = args.keep_clipboard
 
     if args.list_devices:
         list_devices()
